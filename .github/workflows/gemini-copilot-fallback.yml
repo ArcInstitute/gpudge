@@ -1,0 +1,161 @@
+name: Gemini auto-review monitor
+
+# Gemini Code Assist is the default auto-reviewer (.gemini/config.yaml has
+# code_review: disable: false). This workflow watches each new PR for
+# Gemini activity and surfaces failures so a human/assistant can add
+# Copilot as a fallback reviewer.
+#
+# Why this design (no secrets, partial automation):
+#   - GitHub Actions' default GITHUB_TOKEN can post comments and ping the
+#     `/gemini review` slash command (which Gemini honors), but CANNOT
+#     successfully add `copilot-pull-request-reviewer` as a reviewer.
+#     That requires a PAT with elevated scopes — extra infra to maintain.
+#   - Solution: workflow detects Gemini failure → posts a comment with
+#     the exact CLI command the user (or their Claude session) should run.
+#     The assistant's auto-monitor memory tells future sessions to act on
+#     this comment without prompting.
+#
+# Behavior:
+#   - Polls Gemini activity every 30s, up to 10 min.
+#   - At 5-min mark: if no Gemini activity yet, posts `/gemini review` to
+#     re-trigger (sometimes the Gemini app misses the PR-open webhook).
+#   - Exits cleanly on: substantive Gemini review, quota warning, or 10-min
+#     timeout.
+#   - On quota or timeout: posts a comment with the exact `gh pr edit` command
+#     to add Copilot as a reviewer.
+
+on:
+  pull_request:
+    # `ready_for_review` covers the draft → ready transition. Drafts
+    # themselves are skipped via the job-level `if` below, since Gemini
+    # doesn't auto-review drafts.
+    types: [opened, reopened, ready_for_review]
+
+# Cancel any in-flight monitor run for this PR when a new event fires
+# (e.g. quick close → reopen). Without this, multiple 10-min pollers
+# can race and post duplicate /gemini review or fallback comments.
+concurrency:
+  group: gemini-copilot-fallback-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  # Although gh pr comment posts to /repos/{owner}/{repo}/issues/{n}/comments
+  # which docs say only needs issues:write, in practice GITHUB_TOKEN gets
+  # HTTP 403 "Resource not accessible by integration" on PR-comment posts
+  # without pull-requests:write. Verified empirically 2026-05-26 on
+  # ArcInstitute/gpudge PR #12 — both REST and GraphQL forms failed with
+  # pull-requests:read. pull-requests:write is the proven-working scope.
+  pull-requests: write
+  issues: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    # Skip drafts (Gemini doesn't auto-review until ready_for_review fires)
+    # and skip events triggered by either review bot (defensive; loop-safe).
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.actor != 'gemini-code-assist[bot]' &&
+      github.actor != 'copilot-pull-request-reviewer[bot]'
+    steps:
+      - name: Poll Gemini activity (up to 10 min)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          DEADLINE=$(( $(date +%s) + 600 ))   # 10 min cap
+          RETRY_AT=$(( $(date +%s) + 300 ))   # 5 min re-trigger mark
+          RETRIED=0
+
+          # Match Gemini bot by exact login (substring "gemini" would
+          # false-positive on a human handle containing "gemini"). The
+          # API reports the bot as both "gemini-code-assist" and
+          # "gemini-code-assist[bot]" across different contexts; accept
+          # both to be safe.
+          GEMINI_FILTER='[.[] | select(.user.login == "gemini-code-assist" or .user.login == "gemini-code-assist[bot]")]'
+
+          # Re-check PR state before any post. The poll window is 10 min;
+          # the PR can be closed/merged/redrafted mid-poll. Returns 0
+          # (skip comment) when state isn't "open ready".
+          pr_still_open_and_ready() {
+            STATE=$(gh api "repos/$REPO/pulls/$PR" --jq '.state + " draft=" + (.draft|tostring)')
+            [ "$STATE" = "open draft=false" ]
+          }
+
+          # Post the "add Copilot as fallback" comment, parameterised by
+          # the reason (quota / timeout). Multi-line printf so the body
+          # is built on properly-YAML-indented lines without breaking
+          # the run-block scalar.
+          post_fallback_comment() {
+            local reason="$1"
+            local body
+            body=$(printf '%s\n\n%s\n%s\n%s\n\n%s\n' \
+              "$reason" \
+              '```' \
+              "gh pr edit $PR --repo $REPO --add-reviewer copilot-pull-request-reviewer" \
+              '```' \
+              'Then watch for a review from `copilot-pull-request-reviewer[bot]` (usually within 2-3 min).')
+            gh pr comment "$PR" --repo "$REPO" --body "$body"
+          }
+
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            # --paginate so PRs with >30 comments/reviews don't truncate
+            # trailing activity. Each --paginate call concatenates all
+            # pages, then GEMINI_FILTER selects Gemini-authored entries.
+            REVIEWS=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" --jq "$GEMINI_FILTER")
+            ICOMMENTS=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq "$GEMINI_FILTER")
+
+            REAL_REVIEW=$(echo "$REVIEWS" | jq '[.[] | select(.body != null and .body != "")] | length')
+            QUOTA_WARN=$(echo "$ICOMMENTS" | jq '[.[] | select(.body | test("quota|daily limit|rate limit"; "i"))] | length')
+            # Gemini posts this when the PR diff only contains file types it can't review (e.g., YAML).
+            # Permanent rejection — no point waiting for the 10-min timeout.
+            UNSUPPORTED_WARN=$(echo "$ICOMMENTS" | jq '[.[] | select(.body | test("unable to generate a review"; "i"))] | length')
+            ANY_GEMINI=$(echo "$ICOMMENTS" | jq 'length')
+
+            echo "poll: real_reviews=$REAL_REVIEW quota_warnings=$QUOTA_WARN unsupported=$UNSUPPORTED_WARN any_gemini_comments=$ANY_GEMINI"
+
+            if [ "$REAL_REVIEW" -gt 0 ]; then
+              echo "Gemini posted a substantive review. Done."
+              exit 0
+            fi
+
+            if [ "$QUOTA_WARN" -gt 0 ]; then
+              if pr_still_open_and_ready; then
+                post_fallback_comment "ℹ️ **Gemini hit its daily quota.** To add Copilot Code Review as fallback, run:"
+              else
+                echo "PR no longer open+ready; skipping quota fallback comment."
+              fi
+              exit 0
+            fi
+
+            if [ "$UNSUPPORTED_WARN" -gt 0 ]; then
+              if pr_still_open_and_ready; then
+                post_fallback_comment "ℹ️ **Gemini cannot review the file types in this PR.** To add Copilot Code Review as fallback, run:"
+              else
+                echo "PR no longer open+ready; skipping unsupported fallback comment."
+              fi
+              exit 0
+            fi
+
+            # 5-min mark: re-trigger Gemini if it hasn't posted anything
+            if [ "$RETRIED" -eq 0 ] && [ "$(date +%s)" -gt "$RETRY_AT" ] && [ "$ANY_GEMINI" -eq 0 ]; then
+              if pr_still_open_and_ready; then
+                echo "5 min elapsed with no Gemini activity — re-triggering with /gemini review"
+                gh pr comment "$PR" --repo "$REPO" --body "/gemini review"
+                RETRIED=1
+              else
+                echo "PR no longer open+ready; skipping /gemini re-trigger and exiting."
+                exit 0
+              fi
+            fi
+
+            sleep 30
+          done
+
+          # 10-min timeout
+          if pr_still_open_and_ready; then
+            post_fallback_comment "ℹ️ **Gemini did not review within 10 minutes.** To add Copilot Code Review as fallback, run:"
+          else
+            echo "PR no longer open+ready; skipping timeout fallback comment."
+          fi

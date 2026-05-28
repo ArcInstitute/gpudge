@@ -1,0 +1,13 @@
+# Gemini Code Assist configuration for ArcInstitute/gpudge.
+#
+# Gemini is the DEFAULT auto-reviewer. On PR open, Gemini-code-assist[bot]
+# reviews automatically. If Gemini fails (quota exhausted) or takes more
+# than 10 minutes, the fallback workflow
+# (.github/workflows/gemini-copilot-fallback.yml) requests Copilot Code
+# Review as a backup.
+#
+# Quota: Gemini free tier 33 PR reviews/user/day (resets every 24h).
+# Manual trigger: `/gemini review` in a PR comment (works regardless of config).
+
+code_review:
+  disable: false

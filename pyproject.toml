@@ -1,0 +1,44 @@
+[project]
+name = "gpudge"
+version = "0.1.0"
+description = "Lightweight GPU-only Mann–Whitney U differential expression."
+readme = "README.md"
+authors = [{ name = "Arc Institute" }]
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.12"
+dependencies = [
+    "anndata>=0.12",
+    "hdf5plugin>=6.0.0",
+    "numpy>=2",
+    "polars>=1.38",
+    "pyarrow>=20",
+    "scipy>=1.17",
+    "shardad>=0.2.0",
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "scanpy>=1.12"]
+fast = ["numba>=0.59"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpudge"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "platform_system == 'Linux'" }]
+# shardad v0.2.0 is hosted privately at ArcInstitute/shardad until PyPI
+# distribution is decided. Pin to the v0.2.0 tag via SSH; switch to a
+# PyPI version string once it's published.
+shardad = { git = "ssh://git@github.com/ArcInstitute/shardad.git", rev = "v0.2.0" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
