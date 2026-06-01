@@ -13,7 +13,10 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
 
 - Public API: `de()`, `ALL_OTHERS` sentinel (= `"__all_others__"`),
   `MeanCalc` literal, `__version__`. The pre-v0.1 spelling `"all_others"`
-  is accepted with `DeprecationWarning`; will be removed in v0.1.0.
+  is accepted with `DeprecationWarning`; will be removed in a future release.
+- Gene-level filtering is **opt-in** (all `filter_gene_*` params default to
+  `None`); `min_feature_filter` is removed. See the `de()` docstring for the
+  full set of per-gene filter params.
 - Internal modules (underscore-prefixed): `_mwu` (MWU stats), `_fdr` (per-group
   BH), `_means`, `_ingest`, `_stream`, `_output`, `_csr_dense` (numba CSR
   slicer; optional dep).
@@ -29,8 +32,9 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
 ## Performance reference (cell line 2: 2.06M cells × 18.5k genes × 4672 guides)
 
 - Default scipy path: ~313 s on H100.
-- `[fast]` (numba CSR kernel): ~108 s on H100. Same hardware, 5.5× faster
-  than `pdex.pdex` reference (~597 s).
+- `[fast]` (numba CSR kernel): **~51 s** on H100 (v0.1.0, after the T1–T5 perf
+  series; the older ~108 s was the pre-series T0 baseline). ~12× faster than the
+  `pdex.pdex` reference (~597 s). The CHANGELOG perf table is the source of truth.
 - `densify_input=True` opt-in: ~225 s but needs ~310 GB host RAM transient.
 
 ## How to extend

@@ -36,7 +36,9 @@ def _make_synth(n_cells: int, n_genes: int, n_guides: int,
            "comparison": np.where(np.char.startswith(guide_labels, "non-targeting"),
                                   "ntc", guide_labels)}
     var = {"gene_id": [f"g{i}" for i in range(n_genes)]}
-    return ad.AnnData(X=X, obs=obs, var=var)
+    adata = ad.AnnData(X=X, obs=obs, var=var)
+    adata.var_names = [f"g{i}" for i in range(n_genes)]
+    return adata
 
 
 @pytest.fixture

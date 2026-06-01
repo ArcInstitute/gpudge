@@ -162,3 +162,33 @@ def test_narrow_dtypes_match_float32(data_dtype, indices_dtype):
     want = _reference(X_f32, rows, 10, 130)
     assert got.dtype == np.float32
     np.testing.assert_array_equal(got, want)
+
+
+# --- csr_row_sums (used by cpm_normalize; numba kernel + scipy/dense fallback) ---
+
+def test_csr_row_sums_matches_dense_float32():
+    from gpudge._csr_dense import csr_row_sums
+    rng = np.random.default_rng(0)
+    dense = rng.integers(0, 5, size=(6, 4)).astype(np.float32)
+    dense[2] = 0.0  # a zero row
+    got = csr_row_sums(csr_matrix(dense))
+    assert got.dtype == np.float64
+    np.testing.assert_allclose(got, dense.sum(axis=1))
+
+
+def test_csr_row_sums_uint16_casts_to_float64():
+    # narrow-dtype CSR: result must accumulate in float64 (scipy sum(axis=1) is
+    # pathologically slow on uint16 — the perf reason csr_row_sums exists). Path
+    # is numba when installed, scipy otherwise; both must give the same answer.
+    from gpudge._csr_dense import csr_row_sums
+    dense = np.array([[1, 2, 0], [0, 0, 0], [65000, 1, 2]], dtype=np.uint16)
+    got = csr_row_sums(csr_matrix(dense))
+    assert got.dtype == np.float64
+    np.testing.assert_allclose(got, dense.astype(np.float64).sum(axis=1))
+
+
+def test_csr_row_sums_dense_fallback():
+    from gpudge._csr_dense import csr_row_sums
+    dense = np.arange(12, dtype=np.float32).reshape(3, 4)
+    got = csr_row_sums(dense)  # dense ndarray -> scipy .sum(axis=1) fallback
+    np.testing.assert_allclose(got, dense.sum(axis=1))

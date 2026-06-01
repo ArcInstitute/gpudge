@@ -64,17 +64,33 @@ def _rank_with_ties(
 
 
 def _tie_term_per_gene(sorted_values: torch.Tensor) -> torch.Tensor:
-    """Σ(t^3 - t) per gene for a (n_genes, k) sorted tensor.
+    """Σ(t^3 - t) per gene for a (n_genes, k) tensor sorted along dim=1.
 
-    Uses torch.unique_consecutive per row. The Python loop adds ~0.1ms per
-    gene, negligible relative to the rest of the chunk loop on cell line 2 scale.
+    Vectorized: mark tie-run boundaries along the sorted axis, count run
+    lengths with one scatter_add, then Σ(t^3 - t) per row. Replaces a Python
+    per-gene loop over torch.unique_consecutive (thousands of kernel launches
+    per chunk at cell line 2 scale). (ultrareview perf.)
     """
-    n_genes = sorted_values.shape[0]
-    out = torch.empty(n_genes, dtype=torch.float64, device=sorted_values.device)
-    for i in range(n_genes):
-        _v, c = torch.unique_consecutive(sorted_values[i], return_counts=True)
-        c = c.to(torch.float64)
-        out[i] = torch.sum(c * c * c - c)
+    n_genes, k = sorted_values.shape
+    out = torch.zeros(n_genes, dtype=torch.float64,
+                      device=sorted_values.device)
+    if n_genes == 0 or k == 0:
+        return out                                      # no ties possible
+    # Process genes in blocks so the O(block x k) int64 run_id + f64 ones
+    # scratch (~16 B/elem) stays bounded for a wide reference pool — it must
+    # not balloon past the gene chunk's own ranking buffers. (Codex review.)
+    block = max(1, min(n_genes, 64_000_000 // k))
+    for s in range(0, n_genes, block):
+        sv = sorted_values[s:s + block]
+        new_run = torch.ones_like(sv, dtype=torch.bool)
+        new_run[:, 1:] = sv[:, 1:] != sv[:, :-1]        # value changes
+        run_id = new_run.cumsum(dim=1) - 1              # (block, k) run index
+        n_runs = int(run_id[:, -1].max().item()) + 1
+        counts = torch.zeros((sv.shape[0], n_runs), dtype=torch.float64,
+                             device=sv.device)
+        counts.scatter_add_(1, run_id,
+                            torch.ones_like(sv, dtype=torch.float64))
+        out[s:s + block] = (counts ** 3 - counts).sum(dim=1)
     return out
 
 

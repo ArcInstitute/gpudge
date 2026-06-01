@@ -64,3 +64,39 @@ def test_mwu_ref_ignores_ref_row():
     labels_t = torch.from_numpy(labels).cuda()
     U, p = mwu_ref(X_t, labels_t, n_groups, ref_idx=ref_idx)
     assert torch.isnan(p[ref_idx]).all()
+
+
+# --- _tie_term_per_gene: Σ(t^3 - t) tie correction (GPU-free; CPU tensors) ---
+
+def test_tie_term_per_gene_known_runs():
+    from gpudge._mwu import _tie_term_per_gene
+    # one gene; sorted run lengths 3,1,2 -> (27-3)+(1-1)+(8-2) = 24+0+6 = 30
+    got = _tie_term_per_gene(torch.tensor([[0., 0., 0., 1., 2., 2.]]))
+    assert got.shape == (1,)
+    assert float(got[0]) == 30.0
+
+
+def test_tie_term_per_gene_no_ties_is_zero():
+    from gpudge._mwu import _tie_term_per_gene
+    assert float(_tie_term_per_gene(torch.tensor([[1., 2., 3., 4.]]))[0]) == 0.0
+
+
+def test_tie_term_per_gene_all_tied():
+    from gpudge._mwu import _tie_term_per_gene
+    # one run of 4 -> 4^3 - 4 = 60
+    assert float(_tie_term_per_gene(torch.tensor([[5., 5., 5., 5.]]))[0]) == 60.0
+
+
+def test_tie_term_per_gene_multi_gene():
+    from gpudge._mwu import _tie_term_per_gene
+    got = _tie_term_per_gene(torch.tensor([[0., 0., 1., 1.],    # 6 + 6 = 12
+                                           [3., 3., 3., 3.]]))  # one run -> 60
+    assert got.shape == (2,)
+    assert [float(x) for x in got] == [12.0, 60.0]
+
+
+def test_tie_term_per_gene_empty_inputs():
+    # (0, k) and (n, 0) must return zeros, not raise (gpudge#ultrareview/Codex).
+    from gpudge._mwu import _tie_term_per_gene
+    assert _tie_term_per_gene(torch.empty(0, 5)).shape == (0,)
+    assert [float(x) for x in _tie_term_per_gene(torch.empty(3, 0))] == [0.0, 0.0, 0.0]

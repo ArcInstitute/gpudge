@@ -40,10 +40,10 @@ def assemble_dataframe(
 
     # Validate flat_keep eagerly so the size check fires before either
     # branch, and short-circuit an all-True mask to the unfiltered path.
-    # `min_feature_filter=0.0` produces such a mask; with it, the filtered
-    # path would allocate full-length guide_idx/gene_idx int64 arrays and
-    # do large fancy-indexing for no row reduction. np.all is O(n) but
-    # short-circuits on the first False — the worst case (all-True) is
+    # (An unfiltered run -- no filter_gene_* set -- produces such a mask; with
+    # it, the filtered path would allocate full-length guide_idx/gene_idx int64
+    # arrays and do large fancy-indexing for no row reduction. np.all is O(n)
+    # but short-circuits on the first False — the worst case (all-True) is
     # exactly the case where we save much more than the scan costs.
     if flat_keep is not None:
         fk = np.asarray(flat_keep)

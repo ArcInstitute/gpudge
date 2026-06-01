@@ -34,7 +34,7 @@ def ingest(adata: ad.AnnData, *, groupby: str, reference: str) -> IngestedState:
         warnings.warn(
             f"reference={LEGACY_ALL_OTHERS!r} is deprecated; pass the "
             f"ALL_OTHERS constant (or the string {ALL_OTHERS!r}) instead. "
-            "The legacy spelling will be removed in v0.1.0.",
+            "The legacy spelling will be removed in a future release.",
             DeprecationWarning,
             stacklevel=2,
         )

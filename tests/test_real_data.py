@@ -29,9 +29,8 @@ def test_real_chunk_matches_cpu_pdex_baseline():
         combined.obs["target_guide"].astype(str),
     )
     got = de(combined, groupby="comparison", reference="ntc",
-             mean_calc="geometric",       # to match pdex's default
-             min_feature_filter=1.0,
-             epsilon=0.0)
+             mean_calc="geometric", epsilon=0.0,
+             filter_gene_min_mean_value=1.0)
 
     # Compare against CPU baseline restricted to chunk_0000's guides
     cpu = pl.read_parquet(REAL / "target_de.parquet")
