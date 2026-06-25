@@ -40,8 +40,10 @@ def test_negative_threshold_keeps_all_even_with_negative_values():
 
 
 def test_and_across_multiple_filters():
-    a_t = np.array([[5.0, 5.0, 0.0]]); a_r = np.array([0.0, 0.0, 0.0])
-    b_t = np.array([[0.0, 5.0, 5.0]]); b_r = np.array([0.0, 0.0, 0.0])
+    a_t = np.array([[5.0, 5.0, 0.0]])
+    a_r = np.array([0.0, 0.0, 0.0])
+    b_t = np.array([[0.0, 5.0, 5.0]])
+    b_r = np.array([0.0, 0.0, 0.0])
     keep = combined_keep_mask(1, 3, filters=[(a_t, a_r, 1.0), (b_t, b_r, 1.0)])
     np.testing.assert_array_equal(keep, [[False, True, False]])
 
@@ -52,7 +54,8 @@ def test_no_filters_no_keep_genes_keeps_all():
 
 
 def test_keep_genes_anded_and_broadcast():
-    tq = np.full((2, 3), 5.0); rq = np.zeros(3)
+    tq = np.full((2, 3), 5.0)
+    rq = np.zeros(3)
     kg = np.array([True, False, True])
     keep = combined_keep_mask(2, 3, filters=[(tq, rq, 1.0)], keep_genes=kg)
     np.testing.assert_array_equal(keep, [[True, False, True], [True, False, True]])
@@ -90,7 +93,8 @@ def test_x_has_noncount_signal_dense_fractional_last_element():
 
 
 def test_x_has_noncount_signal_dense_negative():
-    x = np.ones((4, 4), dtype=np.float32); x[0, 0] = -1.0
+    x = np.ones((4, 4), dtype=np.float32)
+    x[0, 0] = -1.0
     assert x_has_noncount_signal(x) is True
 
 
@@ -105,14 +109,14 @@ def test_x_has_noncount_signal_sparse_uses_data():
     assert x_has_noncount_signal(x) is True
 
 
-# _row_scale_needs(cpm_normalize, min_cpm_cell, min_cpm_bulk)
+# _row_scale_needs(scale_main, min_cpm_cell, min_cpm_bulk, median_requested)
 #   -> (need_row_sums_np, need_row_scales_t)
 # row_scales_t (GPU 1e6/L tensor + per-group row-index tensors) is only used to
-# CPM-scale the test tensor (cpm_normalize) or the per-cell-CPM unit (cpm_cell).
+# normalize the test tensor (scale_main) or the per-cell-CPM unit (cpm_cell).
 # cpm_bulk needs only the CPU row sums (-> group_libtot), NOT row_scales_t.
-@pytest.mark.parametrize("cpm_normalize,min_cpm_cell,min_cpm_bulk,expected", [
+@pytest.mark.parametrize("scale_main,min_cpm_cell,min_cpm_bulk,expected", [
     (False, None, None, (False, False)),   # no CPM anything -> nothing
-    (True,  None, None, (True,  True)),     # cpm_normalize scales the test tensor
+    (True,  None, None, (True,  True)),     # normalize scales the test tensor
     (False, 1.0,  None, (True,  True)),     # cpm_cell needs the per-cell scale
     (False, None, 1.0,  (True,  False)),    # cpm_bulk-only: row sums yes, scale NO
     (False, 1.0,  1.0,  (True,  True)),     # cell forces the scale tensor
@@ -120,6 +124,7 @@ def test_x_has_noncount_signal_sparse_uses_data():
     (True,  1.0,  None, (True,  True)),
     (True,  1.0,  1.0,  (True,  True)),
 ])
-def test_row_scale_needs_truth_table(cpm_normalize, min_cpm_cell, min_cpm_bulk,
+def test_row_scale_needs_truth_table(scale_main, min_cpm_cell, min_cpm_bulk,
                                      expected):
-    assert _row_scale_needs(cpm_normalize, min_cpm_cell, min_cpm_bulk) == expected
+    assert _row_scale_needs(
+        scale_main, min_cpm_cell, min_cpm_bulk, median_requested=False) == expected

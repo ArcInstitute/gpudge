@@ -81,7 +81,7 @@ def run_gene_chunks_with_recovery(
     *,
     oom_recovery: bool = True,
     floor: int = 64,
-) -> None:
+) -> int:
     """Drive ``process_chunk(start, stop)`` over gene-chunks of width ``chunk``.
 
     On ``torch.cuda.OutOfMemoryError`` it empties the CUDA cache and, if
@@ -92,6 +92,12 @@ def run_gene_chunks_with_recovery(
     re-processed gene range (gpudge writes per-gene accumulators by absolute
     index, so re-covering ``[start, stop)`` overwrites identically). Raises
     ``RuntimeError`` if ``oom_recovery`` is False or the floor still OOMs.
+
+    Returns the final chunk width — the initial width if no OOM occurred, or the
+    downshifted width it settled on. Callers that drive multiple passes (the
+    shard-streaming driver, one pass per target group) can feed this back as the
+    next pass's ``initial_chunk`` so a downshift persists instead of being
+    rediscovered (and re-paying the OOM + ``empty_cache``) every pass.
     """
     if initial_chunk <= 0:
         raise ValueError(f"initial_chunk must be > 0, got {initial_chunk}")
@@ -136,3 +142,4 @@ def run_gene_chunks_with_recovery(
             chunk, new_chunk,
         )
         chunk = new_chunk
+    return chunk

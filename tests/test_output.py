@@ -117,3 +117,29 @@ def test_1d_ref_mean_wrong_length_raises():
     args["ref_mean"] = np.array([1.0, 2.0, 3.0, 4.0, 5.0])  # length 5
     with pytest.raises(ValueError, match=r"ref_mean has shape \(5,\)"):
         assemble_dataframe(**args)
+
+
+def test_empty_output_frame_is_typed_and_matches_assemble():
+    """empty_output_frame() must be a 0-row frame with the SAME typed schema as
+    a real assemble_dataframe output (not Null columns), and must honour
+    output_columns the same way. Regression for the ultrareview empty-archive
+    schema finding + the Gemini review note: a frame built from empty lists has
+    all-Null columns that mismatch the non-empty result downstream."""
+    from gpudge._output import empty_output_frame
+    real = assemble_dataframe(
+        target=np.array(["g0"]), feature=np.array(["a", "b"]),
+        target_mean=np.zeros((1, 2)), ref_mean=np.zeros(2),
+        target_ncells=np.array([3], dtype=np.int64), ref_ncells=int(4),
+        log2_fold_change=np.zeros((1, 2)), p_value=np.ones((1, 2)),
+        test_statistic=np.zeros((1, 2)), p_adj=np.zeros((1, 2)),
+        flat_keep=None, output_columns=None)
+    empty = empty_output_frame()
+    assert empty.height == 0
+    assert empty.columns == list(DEFAULT_OUTPUT_COLUMNS)
+    assert empty.schema == real.schema                  # typed, matches real path
+    assert pl.Null not in empty.schema.values()         # no Null columns
+    # output_columns select+rename applies the same as the non-empty path
+    renamed = empty_output_frame({"target": "guide", "p_value": "p"})
+    assert renamed.columns == ["guide", "p"]
+    assert renamed.schema["guide"] == pl.String
+    assert renamed.schema["p"] == pl.Float64

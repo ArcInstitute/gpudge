@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.0] — 2026-06-24
+
+Feature + tooling release: native shard-streaming `de(shard_archive=…)`,
+scanpy-compatible library-size normalization, the multi-agent "ultrareview"
+hardening pass, a published benchmark campaign (vs scanpy / CPU pdex /
+rapids-singlecell), and packaging / CI / docs work. **No breaking changes since
+v0.2.0** (the Mann–Whitney DE core is unchanged).
+
+Distribution remains **Arc-internal** — install from the `v0.3.0` git tag
+(requires ArcInstitute SSH access); not on PyPI.
+
+### Added
+
+- `de(shard_archive=...)`: native shard-streaming over a shardad target-aware v2
+  archive — keeps the reference pool resident-sorted on the GPU and streams
+  guide-shards past it, bounding host RAM to ~reference + one shard. A
+  memory/feasibility path for datasets too large to materialize in host RAM
+  (e.g. the full 5.54 M-cell cell line 2 runs in ~31 GB host), **not a speedup** — it is
+  ~7× slower wall-clock than the narrowed in-memory path. Supports Mode 1
+  (archive reference shard as the pooled control) and Mode 2 (external
+  `reference=<AnnData>` pool). `ALL_OTHERS` and oversized references are
+  unsupported in v1. Requires the optional `[streaming]` extra. (#36)
+- `de(normalize_target_sum=...)` — scanpy-compatible on-the-fly library-size
+  normalization. Accepts a positive number (`normalize_total(target_sum=N)`) or
+  `"median"` (scanpy's default `target_sum=None`). `cpm_normalize=True` is
+  equivalent to `normalize_target_sum=1e6`; exactly one of the two may be set.
+  Supported in both in-memory and shard-streaming modes (streaming `"median"`
+  adds an up-front row-sum pass over the archive). (#52)
+
+### Changed
+
+- Shard-streaming Mode 2: passing an external `reference=<AnnData>` against an
+  archive that *also* carries its own reference shard now **warns and uses the
+  external pool** (the archive reference is ignored — "Semantics A") instead of
+  raising. The earlier no-reference-archive requirement is relaxed to a
+  `UserWarning`. (#56)
+
+### Fixed
+
+- ultrareview hardening — shared-validation parity between the in-memory and
+  shard-streaming paths: the legacy `reference="all_others"` remap and the
+  `mean_calc` / `epsilon` / `output_columns` validation are hoisted above the
+  streaming dispatch, so both paths reject identical inputs before any GPU work;
+  the empty-archive early return now emits the typed canonical output schema
+  (and honours `output_columns`) instead of all-`Null` columns. (#48)
+- `_csr_dense` numba kernels now **sum duplicate column indices within a row**
+  (matching scipy `.toarray()`; previously last-write-wins, so the `[fast]` path
+  could silently disagree with the scipy fallback on non-canonical CSR), and
+  validate row indices are in `[0, n_rows)` (raising `IndexError` instead of
+  reading `indptr` out of bounds under `boundscheck=False`). Canonical CSR is
+  unaffected. (#48)
+- OOM-recovery driver returns its final (possibly downshifted) gene-chunk width
+  so the shard-streaming driver carries it across target groups instead of
+  re-discovering — and re-paying — the downshift on every group; trailing-chunk
+  H2D in the ref-mode group loop is repacked contiguous to preserve the async
+  pinned copy; geometric-mean out-of-domain contract pinned + documented
+  (`X < -1` → NaN, `X == -1` → -1.0). (#42, #43, #46, #47, #49)
+
+### Performance / Accuracy
+
+- Published a benchmark campaign comparing
+  gpudge against scanpy (CPU), CPU pdex, and rapids-singlecell (GPU) on cell line 1 and
+  cell line 2. Because gpudge runs the whole screen as one GPU pass, its DE-stage time
+  is **near-constant in the perturbation count**, where per-group tools scale
+  ~linearly. Headline DE-stage results (H100 80 GB):
+  - **cell line 1 / 500 perturbations** (239,054 cells × 18,533 genes): gpudge
+    **7.2 s** vs CPU pdex **4,285 s** (71 min, 32 workers) = **~595×**, results
+    **bit-identical** (log2FC & p-value Pearson > 0.999999999 over 5.5 M
+    gene–perturbation pairs); vs rapids-singlecell ~1.0e3 s, vs scanpy ~9 h.
+  - rapids-singlecell VRAM grows with the perturbation count and **OOMs** at
+    higher rungs (cell line 1 full, cell line 2 ≥ 200); gpudge VRAM stays flat (~15 GB cell line 1 /
+    ~29 GB cell line 2). (#50, #51)
+
+### Packaging / CI
+
+- First CI workflow (`.github/workflows/ci.yml`): `ruff` + CPU `pytest` on every
+  push / PR (ubuntu-latest, Python 3.12). Installs via
+  `uv pip install -e ".[dev,fast]"` so the private shardad git-SSH source is
+  never resolved on the runner; GPU (`needs_cuda`), shardad streaming
+  (`importorskip`), and real-data tests auto-skip. The `ruff` gate is blocking;
+  the repo was brought to zero lint errors (47 fixed). Green at 121 passed /
+  53 skipped. (#53)
+
+### Docs / Tooling
+
+- `docs/THIRD_PARTY_LICENSES.md` — third-party license audit. (#38)
+- `gpudge-usage` reference skill (`.claude/skills/gpudge-usage/`) — install +
+  `de()` usage guide covering pip/uv/conda + extras, one-vs-rest (`ALL_OTHERS`),
+  shardad archive streaming, CPM / library-size normalization, and the opt-in
+  per-gene filters. (#55)
+- README gains a **Performance** section (4-engine DE-stage comparison incl. CPU
+  pdex, a full-5.54 M-cell cell line 2 "RAM by data layout" table, and a concrete
+  streaming result), cell line 2-based usage examples, and reconciled install pins
+  (gpudge `@v0.3.0`; the `[streaming]` extra's shardad pinned to the commit
+  carrying the target-aware reader API, which postdates the shardad v0.2.0 tag).
+
 ## [0.2.0] — 2026-06-01
 
 ### Changed (BREAKING)
@@ -171,6 +269,7 @@ ULP of the CPU baseline on every assertable column.
   scale (237s vs 17s). Stay on v1 archives for cell line 2-scale inputs
   until shardad v0.3 lands an on-GPU read path.
 
-[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ArcInstitute/gpudge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ArcInstitute/gpudge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ArcInstitute/gpudge/releases/tag/v0.1.0

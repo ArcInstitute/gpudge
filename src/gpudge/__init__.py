@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import warnings
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Literal
@@ -16,13 +17,14 @@ import torch
 from ._csr_dense import HAS_NUMBA, csr_row_sums, csr_rows_col_range_to_dense
 from ._ingest import ALL_OTHERS, LEGACY_ALL_OTHERS as _LEGACY_ALL_OTHERS, ingest
 from ._means import group_means
-from ._mwu import mwu_one_group, _rank_with_ties, _tie_term_per_gene
+from ._mwu import _rank_with_ties, _tie_term_per_gene
 from ._fdr import bh_per_group
 from ._output import DEFAULT_OUTPUT_COLUMNS, assemble_dataframe
 from ._stream import (
     _auto_gene_chunk_size,
     run_gene_chunks_with_recovery,
 )
+from ._shard_stream import group_chunk_stats
 
 try:
     __version__ = _pkg_version("gpudge")
@@ -80,18 +82,21 @@ def _row_col_slice_np(
 def _refmode_chunk_keep(
     start, stop, ch,
     arith_target_acc, arith_ref_acc, other_target_acc, other_ref_acc,
-    counts, ref_label_idx, group_libtot, cpm_normalize,
+    counts, ref_label_idx, group_libtot, target_sum,
     min_mean_value, min_total_value, min_cpm_cell, min_cpm_bulk,
     keep_genes_arr,
 ):
     from ._filter import combined_keep_mask
     n_groups = arith_target_acc.shape[0]
     sl = slice(start, stop)
-    if cpm_normalize:
-        scaled_t = arith_target_acc[:, sl]
-        scaled_r = arith_ref_acc[sl]
+    if target_sum is not None:
+        # main holds the normalized unit; cpm filter unit = main * 1e6/target_sum
+        from ._normalize import cpm_rescale_factor
+        f = cpm_rescale_factor(target_sum)
         unscaled_t = other_target_acc[:, sl] if other_target_acc is not None else None
         unscaled_r = other_ref_acc[sl] if other_ref_acc is not None else None
+        scaled_t = arith_target_acc[:, sl] * f
+        scaled_r = arith_ref_acc[sl] * f
     else:
         unscaled_t = arith_target_acc[:, sl]
         unscaled_r = arith_ref_acc[sl]
@@ -122,16 +127,18 @@ def _refmode_chunk_keep(
 def _all_others_chunk_keep(
     start, stop, ch,
     arith_np, other_target_acc, counts_np, rest_count_safe,
-    group_libtot, cpm_normalize,
+    group_libtot, target_sum,
     min_mean_value, min_total_value, min_cpm_cell, min_cpm_bulk,
     keep_genes_arr,
 ):
     from ._filter import combined_keep_mask
     n_groups = arith_np.shape[0]
     sl = slice(start, stop)
-    if cpm_normalize:
-        scaled_t = arith_np
+    if target_sum is not None:
+        from ._normalize import cpm_rescale_factor
+        f = cpm_rescale_factor(target_sum)
         unscaled_t = other_target_acc[:, sl] if other_target_acc is not None else None
+        scaled_t = arith_np * f
     else:
         unscaled_t = arith_np
         scaled_t = other_target_acc[:, sl] if other_target_acc is not None else None
@@ -165,10 +172,11 @@ def _all_others_chunk_keep(
 
 
 def de(
-    adata: ad.AnnData,
+    adata: ad.AnnData | None = None,
     *,
-    groupby: str,
-    reference: str,
+    shard_archive: str | os.PathLike | None = None,
+    groupby: str | None = None,
+    reference: str | ad.AnnData | None = None,   # str | ALL_OTHERS sentinel | ad.AnnData | None
     mean_calc: MeanCalc = "arithmetic",
     epsilon: float = 1e-9,
     min_feature_filter=_REMOVED,
@@ -176,6 +184,7 @@ def de(
     oom_recovery: bool = True,
     densify_input: bool = False,
     cpm_normalize: bool = False,
+    normalize_target_sum: float | int | str | None = None,
     output_columns: dict[str, str] | None = None,
     filter_gene_min_mean_value: float | None = None,
     filter_gene_min_total_value: float | None = None,
@@ -197,12 +206,16 @@ def de(
         sparse X is streamed to GPU per gene-chunk.
     groupby : str
         Column in ``adata.obs`` that defines the groups (e.g. guide identity).
-    reference : str
+    reference : str | anndata.AnnData | None
         Name of the reference group in ``adata.obs[groupby]``, OR the
         ``ALL_OTHERS`` sentinel (``"__all_others__"``) for 1-vs-rest
         comparisons. The pre-v0.1 spelling ``"all_others"`` is still
         accepted with a ``DeprecationWarning`` and will be removed in
         a future release; pass ``ALL_OTHERS`` (or the new string) instead.
+        When streaming (``shard_archive=``), ``reference`` may instead be an
+        ``AnnData`` external control pool (Mode 2). If the archive also
+        designates its own reference shard, the external pool wins and the
+        archive's reference shard is ignored (a ``UserWarning`` is emitted).
     mean_calc : {"arithmetic", "geometric"}, default "arithmetic"
         How ``target_mean`` and ``ref_mean`` (and the log2 fold change derived
         from them) are computed. Independent of any active gene filter, which
@@ -281,6 +294,19 @@ def de(
         ``scanpy.pp.normalize_total(adata, target_sum=1e6)`` but does not
         mutate ``adata.X``. Use when you want to feed raw counts and skip
         the upfront ``normalize_total`` pass.
+    normalize_target_sum : float | int | str | None, default None
+        On-the-fly per-cell library-size normalization, applied like
+        ``cpm_normalize`` (inside the chunk loop, **without** mutating
+        ``adata.X``). ``None`` = off. A positive number normalizes each cell so
+        its total counts equal that value — equivalent to
+        ``scanpy.pp.normalize_total(adata, target_sum=N)``. The string
+        ``"median"`` normalizes to the median of per-cell total counts over
+        cells with a positive total — scanpy's default
+        ``normalize_total(target_sum=None)``. ``cpm_normalize=True`` is exactly
+        ``normalize_target_sum=1e6``; **only one** of the two may be set (else
+        ``ValueError``). Note the naming nuance: scanpy spells "use the median"
+        as ``target_sum=None``, whereas here ``None`` means "off" and the median
+        is requested with the explicit string ``"median"``.
     output_columns : dict[str, str] | None, default None
         If provided, output only these columns (the dict keys), renamed to
         the dict values. Keys must be from the default output column set:
@@ -333,6 +359,20 @@ def de(
     behaviour, not a bug — it is **not** equivalent to formal
     independent-filtering (which guarantees non-inflation).
     """
+    # --- streaming vs in-memory dispatch (cheap, archive-free checks first) ---
+    _streaming = shard_archive is not None
+    if (adata is None) == (shard_archive is None):
+        raise ValueError(
+            "de(): provide exactly one of adata= or shard_archive= "
+            "(got both or neither)."
+        )
+    if isinstance(reference, ad.AnnData) and not _streaming:
+        raise ValueError(
+            "de(): an AnnData reference= is only supported with shard_archive= "
+            "(streaming mode); for in-memory de() pass a reference group label."
+        )
+    # --- shared input validation (BOTH paths, before any GPU work or archive
+    #     open) so the streaming and in-memory paths reject identical inputs. ---
     if min_feature_filter is not _REMOVED:
         raise ValueError(
             "min_feature_filter was removed. Use filter_gene_min_mean_value= "
@@ -340,10 +380,15 @@ def de(
             "it with cpm_normalize=True (which filtered on CPM), use "
             "filter_gene_min_cpm_cell= instead."
         )
-    # Accept the pre-v0.1 sentinel value with a deprecation warning. Lets
-    # existing callers keep working while we move toward the new
-    # collision-resistant '__all_others__' spelling.
-    if reference == _LEGACY_ALL_OTHERS:
+    # Accept the pre-v0.1 sentinel value with a deprecation warning. This MUST
+    # run before the streaming dispatch so the ALL_OTHERS guard below also
+    # catches the legacy spelling (unsupported with shard_archive=); otherwise
+    # reference='all_others' would skip the warning + NotImplementedError and
+    # fall through to a misleading "not among the reference labels" error — and,
+    # worst case, a real group literally named 'all_others' would be used as a
+    # literal reference. reference may be an AnnData (streaming external pool),
+    # so only the str spelling is remapped.
+    if isinstance(reference, str) and reference == _LEGACY_ALL_OTHERS:
         warnings.warn(
             f"reference={_LEGACY_ALL_OTHERS!r} is deprecated; pass the "
             f"ALL_OTHERS constant (or the string {ALL_OTHERS!r}) instead. "
@@ -359,6 +404,11 @@ def de(
         )
     if epsilon < 0:
         raise ValueError(f"epsilon must be >= 0, got {epsilon!r}.")
+    if cpm_normalize and normalize_target_sum is not None:
+        raise ValueError(
+            "only one of cpm_normalize / normalize_target_sum may be set "
+            "(cpm_normalize=True is equivalent to normalize_target_sum=1e6)."
+        )
     if output_columns is not None:
         unknown = [k for k in output_columns if k not in DEFAULT_OUTPUT_COLUMNS]
         if unknown:
@@ -371,6 +421,40 @@ def de(
             raise ValueError(
                 f"output_columns maps multiple keys to the same name: {dests}."
             )
+
+    if _streaming:
+        if densify_input:
+            raise ValueError(
+                "de(): densify_input is not supported with shard_archive= "
+                "(X is never fully resident when streaming)."
+            )
+        if isinstance(reference, str) and reference == ALL_OTHERS:
+            raise NotImplementedError(
+                f"de(): reference=ALL_OTHERS ({ALL_OTHERS!r}) is not supported with "
+                "shard_archive= (1-vs-rest needs global ranks over all cells)."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "gpudge requires a CUDA GPU; torch.cuda.is_available() returned False"
+            )
+        from ._shard_stream import stream_de
+        return stream_de(
+            shard_archive,
+            groupby=groupby, reference=reference,
+            mean_calc=mean_calc, epsilon=epsilon,
+            gpu_gene_chunk_size=gpu_gene_chunk_size, oom_recovery=oom_recovery,
+            cpm_normalize=cpm_normalize,
+            normalize_target_sum=normalize_target_sum,
+            output_columns=output_columns,
+            filter_gene_min_mean_value=filter_gene_min_mean_value,
+            filter_gene_min_total_value=filter_gene_min_total_value,
+            filter_gene_min_cpm_cell=filter_gene_min_cpm_cell,
+            filter_gene_min_cpm_bulk=filter_gene_min_cpm_bulk,
+            keep_genes=keep_genes, device=torch.device("cuda"),
+        )
+    # ---- in-memory path below ----
+    if groupby is None or reference is None:
+        raise ValueError("de(): in-memory mode requires groupby= and reference=.")
     if reference == ALL_OTHERS and mean_calc == "geometric":
         raise NotImplementedError(
             f"reference={ALL_OTHERS!r} with mean_calc='geometric' is not "
@@ -388,23 +472,44 @@ def de(
     from ._filter import (
         _row_scale_needs, validate_keep_genes, x_has_noncount_signal,
     )
+    from ._normalize import resolve_target_sum
     keep_genes_arr = (validate_keep_genes(keep_genes, int(adata.n_vars))
                       if keep_genes is not None else None)
+    _median_requested = (isinstance(normalize_target_sum, str)
+                         and normalize_target_sum == "median")
+    # Row sums are needed for the median target, for cpm filters, and for any
+    # active normalization scale. Compute them first (cheap), then resolve the
+    # target_sum (which consumes them only for the median).
     _cpm_filter_active = (filter_gene_min_cpm_cell is not None
                           or filter_gene_min_cpm_bulk is not None)
     _count_filter_active = (filter_gene_min_mean_value is not None
                             or filter_gene_min_total_value is not None
                             or filter_gene_min_cpm_bulk is not None)
-    # We already produce the X-units mean (scaled iff cpm_normalize). Compute the
-    # OTHER unit only when a filter in that other unit is active:
-    _need_unscaled_extra = _count_filter_active and cpm_normalize
-    _need_scaled_extra = (filter_gene_min_cpm_cell is not None) and not cpm_normalize
-    # cpm_bulk needs only the CPU row sums (-> group_libtot), NOT the GPU
-    # row_scales / per-group row-index tensors (those serve cpm_normalize +
-    # cpm_cell). Keeping them separate avoids that GPU allocation on cpm_bulk-only
-    # runs. See _row_scale_needs (#32).
+    # We may need row sums BEFORE we know target_sum (the median needs them);
+    # and once target_sum is known, scale_main decides the scale tensor. Resolve
+    # in two steps: (a) decide if row sums are needed at all, (b) resolve, then
+    # (c) decide if the scale tensor is needed.
+    # (normalize_target_sum is not None covers the 'median' case; _cpm_filter_active
+    #  covers cpm_bulk — both are subsets, so no separate terms.)
+    _need_row_sums_for_resolve = (
+        bool(cpm_normalize)
+        or (normalize_target_sum is not None)
+        or _cpm_filter_active)
+    _row_sums_np_early = (csr_row_sums(adata.X)
+                          if _need_row_sums_for_resolve else None)
+    target_sum = resolve_target_sum(
+        cpm_normalize=cpm_normalize,
+        normalize_target_sum=normalize_target_sum,
+        row_sums=_row_sums_np_early)
+    _scale_main = target_sum is not None
+    # Extra-unit needs (generalized from cpm_normalize -> _scale_main). At most
+    # one extra is ever required (the cpm filter unit, when normalization is
+    # active, derives from the main mean by a constant — see _normalize).
+    _need_unscaled_extra = _count_filter_active and _scale_main
+    _need_scaled_extra = (filter_gene_min_cpm_cell is not None) and not _scale_main
     _need_row_sums_np, _need_row_scales_t = _row_scale_needs(
-        cpm_normalize, filter_gene_min_cpm_cell, filter_gene_min_cpm_bulk)
+        _scale_main, filter_gene_min_cpm_cell, filter_gene_min_cpm_bulk,
+        _median_requested)
 
     state = ingest(adata, groupby=groupby, reference=reference)
     n_groups = len(state.unique_labels)
@@ -482,20 +587,24 @@ def de(
         )
         adata.X = adata.X.toarray()
 
-    # Inline CPM scaling. Per-cell scale = 1e6 / row_sum, applied to each
-    # chunk on GPU after upload. Matches scanpy.pp.normalize_total(1e6)
-    # without mutating adata.X. `csr_row_sums` handles both sparse-CSR and
+    # Inline CPM/target-sum scaling. `csr_row_sums` handles both sparse-CSR and
     # dense X uniformly; scipy's `sum(axis=1)` alone is unusably slow on
     # narrow integer dtypes (50× slowdown on uint16 — 292s out of a 392s
     # de() call before the fix).
+    # _need_row_sums_np implies _need_row_sums_for_resolve (every disjunct of the
+    # former is a subset of the latter), so _row_sums_np_early is always present
+    # here — no recompute fallback needed.
     if _need_row_sums_np:
-        row_sums_np = csr_row_sums(adata.X)
+        row_sums_np = _row_sums_np_early
     else:
         row_sums_np = None
     if _need_row_scales_t:
         row_sums_safe = np.where(row_sums_np == 0, 1.0, row_sums_np)
+        # Numerator is target_sum when normalization scales the main unit;
+        # otherwise 1e6 (the scale tensor then only feeds the cpm filter extra).
+        _scale_num = target_sum if _scale_main else 1.0e6
         row_scales = torch.from_numpy(
-            (1.0e6 / row_sums_safe).astype(np.float32)).to(device)
+            (_scale_num / row_sums_safe).astype(np.float32)).to(device)
     else:
         row_scales = None
 
@@ -585,7 +694,7 @@ def de(
 
             # Other-unit per-group mean (no division; from the unscaled block):
             if other_target_acc is not None:
-                if cpm_normalize:
+                if _scale_main:
                     other_unit = group_means(X_chunk, labels_t, n_groups,
                                              kind="arithmetic")
                 else:
@@ -594,8 +703,8 @@ def de(
                 other_target_acc[:, start:stop] = other_unit.cpu().numpy()
                 del other_unit
 
-            # Test/reported path: scale iff cpm_normalize.
-            if cpm_normalize:
+            # Test/reported path: scale iff target_sum is active.
+            if _scale_main:
                 X_chunk = X_chunk * row_scales.unsqueeze(1)
 
             arith = group_means(X_chunk, labels_t, n_groups, kind="arithmetic")
@@ -632,7 +741,7 @@ def de(
             new_keep = _all_others_chunk_keep(
                 start, stop, stop - start,
                 arith_np, other_target_acc, counts_np, rest_count_safe,
-                group_libtot, cpm_normalize,
+                group_libtot, target_sum,
                 filter_gene_min_mean_value, filter_gene_min_total_value,
                 filter_gene_min_cpm_cell, filter_gene_min_cpm_bulk,
                 keep_genes_arr,
@@ -717,15 +826,15 @@ def de(
             # (no memory regression).
             if other_ref_acc is not None:
                 ref_f64_un = ref_t.to(torch.float64)
-                if cpm_normalize:
+                if _scale_main:
                     other_ref_acc[start:stop] = ref_f64_un.mean(dim=0).cpu().numpy()
                 else:
                     rs_ref = row_scales[ref_rows_t].unsqueeze(1).to(torch.float64)
                     other_ref_acc[start:stop] = (
                         (ref_f64_un * rs_ref).mean(dim=0).cpu().numpy())
                 del ref_f64_un
-            # Test/reported path: scale IN PLACE iff cpm_normalize, then cast ONCE.
-            if cpm_normalize:
+            # Test/reported path: scale IN PLACE iff target_sum is active, then cast ONCE.
+            if _scale_main:
                 ref_t.mul_(row_scales[ref_rows_t].unsqueeze(1))
             ref_f64 = ref_t.to(torch.float64)                      # X-units
             arith_ref = ref_f64.mean(dim=0).cpu().numpy()
@@ -794,9 +903,18 @@ def de(
                     # event is a no-op (PyTorch documents this).
                     buf_idx = iter_idx % 2
                     group_h2d_events[buf_idx].synchronize()
+                    # Pack the slice into a CONTIGUOUS (m, ch) view of the pinned
+                    # buffer's flat prefix. The plain out[:m, :ch] view is
+                    # non-contiguous whenever ch < gpu_gene_chunk_size (the
+                    # trailing gene-chunk, or after an OOM downshift), which makes
+                    # .to(device, non_blocking=True) fall back to a synchronous
+                    # staged copy; a contiguous pinned view keeps the async H2D.
+                    # m*ch <= max_group_rows*gpu_gene_chunk_size, so it always
+                    # fits the buffer, and the per-buffer event sync above still
+                    # guards reuse (same underlying storage). (ultrareview #46)
+                    packed = group_host_bufs_np[buf_idx].reshape(-1)[:m * ch].reshape(m, ch)
                     group_dense = _row_col_slice_np(
-                        X_host, g_rows, start, stop,
-                        out=group_host_bufs_np[buf_idx])
+                        X_host, g_rows, start, stop, out=packed)
                     group_t = torch.from_numpy(group_dense).to(
                         device, non_blocking=True)
                     # Record AFTER queuing the H2D so a future
@@ -806,33 +924,20 @@ def de(
                     group_dense = _row_col_slice_np(X_host, g_rows, start, stop)
                     group_t = torch.from_numpy(group_dense).to(device)
                     del group_dense
-                # Other-unit group mean (no division; from the UNSCALED tensor).
-                # Materialize the unscaled f64 only when needed, free before scaling.
+                _scales = (row_scales[group_rows_t[g]]
+                           if row_scales is not None else None)
+                arith_t, reported_t, other_t, u1, p = group_chunk_stats(
+                    group_t, sorted_ref, ref_tie_term, n_ref,
+                    mean_calc=mean_calc, scale_main=_scale_main,
+                    group_scales=_scales, want_other=other_target_acc is not None)
+                arith_target_chunk[g] = arith_t
                 if other_target_acc is not None:
-                    group_f64_un = group_t.to(torch.float64)
-                    if cpm_normalize:
-                        other_target_chunk[g] = group_f64_un.mean(dim=0)
-                    else:
-                        rs_g = row_scales[group_rows_t[g]].unsqueeze(1).to(torch.float64)
-                        other_target_chunk[g] = (group_f64_un * rs_g).mean(dim=0)
-                    del group_f64_un
-                if cpm_normalize:
-                    group_t.mul_(row_scales[group_rows_t[g]].unsqueeze(1))
-                group_f64 = group_t.to(torch.float64)              # X-units
-                arith_target_chunk[g] = group_f64.mean(dim=0)
+                    other_target_chunk[g] = other_t
                 if mean_calc == "geometric":
-                    target_mean_chunk[g] = torch.expm1(
-                        torch.log1p(group_f64).mean(dim=0))
-                del group_f64
-
-                group_T = group_t.T.contiguous()                   # (chunk, m)
-                del group_t
-
-                u1, p = mwu_one_group(
-                    sorted_ref, ref_tie_term, group_T, n_ref=n_ref)
+                    target_mean_chunk[g] = reported_t
                 U_chunk[g] = u1
                 p_chunk[g] = p
-                del group_T, u1, p
+                del group_t, arith_t, reported_t, other_t, u1, p
 
                 iter_idx += 1
 
@@ -856,7 +961,7 @@ def de(
             new_keep = _refmode_chunk_keep(
                 start, stop, ch,
                 arith_target_acc, arith_ref_acc, other_target_acc, other_ref_acc,
-                counts, state.ref_label_idx, group_libtot, cpm_normalize,
+                counts, state.ref_label_idx, group_libtot, target_sum,
                 filter_gene_min_mean_value, filter_gene_min_total_value,
                 filter_gene_min_cpm_cell, filter_gene_min_cpm_bulk,
                 keep_genes_arr,

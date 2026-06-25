@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from conftest import needs_cuda, _make_synth
+from conftest import needs_cuda
 from gpudge import de
 
 
@@ -53,6 +53,128 @@ def test_cpm_normalize_matches_external(synth_small_sparse):
     if finite.sum() > 10:
         corr = np.corrcoef(p_pre[finite], p_inl[finite])[0, 1]
         assert corr > 0.99999, f"cpm_normalize p-value correlation {corr:.6f}"
+
+
+@needs_cuda
+def test_target_sum_1e6_matches_cpm_normalize(synth_small_sparse):
+    """normalize_target_sum=1e6 must be identical to cpm_normalize=True."""
+    import gpudge
+    a = synth_small_sparse
+    out_cpm = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                        cpm_normalize=True)
+    out_ts = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                       normalize_target_sum=1e6)
+    j = out_cpm.join(out_ts, on=["target", "feature"], suffix="_ts")
+    assert np.allclose(j["log2_fold_change"].to_numpy(),
+                       j["log2_fold_change_ts"].to_numpy(), equal_nan=True)
+    assert np.allclose(j["p_value"].to_numpy(),
+                       j["p_value_ts"].to_numpy(), equal_nan=True)
+    assert np.allclose(j["target_mean"].to_numpy(),
+                       j["target_mean_ts"].to_numpy(), equal_nan=True)
+
+
+@needs_cuda
+def test_median_matches_external_normalize_total(synth_small_sparse):
+    """normalize_target_sum='median' == sc.pp.normalize_total(target_sum=None)
+    applied externally, then de() with no normalization."""
+    import gpudge
+    import scanpy as sc
+    a = synth_small_sparse
+    a_ext = a.copy()
+    sc.pp.normalize_total(a_ext, target_sum=None)   # scanpy median
+    out_ext = gpudge.de(a_ext, groupby="comparison", reference="ntc")
+    out_med = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                        normalize_target_sum="median")
+    j = out_ext.join(out_med, on=["target", "feature"], suffix="_m")
+    # log2fc is invariant to the median scale (it cancels in the target/ref
+    # ratio), so it stays tight.
+    lfc_e = j["log2_fold_change"].to_numpy()
+    lfc_m = j["log2_fold_change_m"].to_numpy()
+    fin = np.isfinite(lfc_e) & np.isfinite(lfc_m)
+    np.testing.assert_allclose(lfc_e[fin], lfc_m[fin], rtol=1e-5, atol=1e-7)
+    # p-values differ in the last decimals from float32 multiply ordering
+    # (scanpy normalizes in place; we scale on-GPU in a different order), so
+    # correlate rather than require bit-equality — same convention as
+    # test_cpm_normalize_matches_external.
+    p_e = j["p_value"].to_numpy()
+    p_m = j["p_value_m"].to_numpy()
+    pf = np.isfinite(p_e) & np.isfinite(p_m)
+    assert pf.sum() > 10
+    corr = np.corrcoef(p_e[pf], p_m[pf])[0, 1]
+    assert corr > 0.99999, f"median p-value correlation {corr:.6f}"
+
+
+@needs_cuda
+def test_cpm_cell_filter_orthogonal_to_normalize(synth_small_sparse):
+    """With a non-1e6 normalize_target_sum, filter_gene_min_cpm_cell still gates
+    on 1e6 CPM (derived as norm_mean * 1e6/target_sum), matching the gene set
+    from cpm_normalize=True + the same cpm_cell threshold."""
+    import gpudge
+    a = synth_small_sparse
+    # Reference cpm_cell gene set: under cpm_normalize the cpm_cell filter gates
+    # on 1e6 CPM directly.
+    ref = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                    cpm_normalize=True, filter_gene_min_cpm_cell=1.0)
+    # Under a different normalization target the SAME genes must survive the
+    # cpm_cell gate (the gate is defined at 1e6 regardless of target_sum).
+    got = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                    normalize_target_sum=5e5, filter_gene_min_cpm_cell=1.0)
+    ref_keys = set(zip(ref["target"].to_list(), ref["feature"].to_list()))
+    got_keys = set(zip(got["target"].to_list(), got["feature"].to_list()))
+    assert ref_keys == got_keys
+
+
+@needs_cuda
+def test_two_unit_combination(synth_small_sparse):
+    """normalize_target_sum(non-1e6) + cpm_cell + mean_value together: the kept
+    set equals intersecting the cpm_cell (1e6) gate and the raw mean_value gate
+    computed independently."""
+    import gpudge
+    a = synth_small_sparse
+    full = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                     normalize_target_sum=5e5,
+                     filter_gene_min_cpm_cell=1.0,
+                     filter_gene_min_mean_value=0.0)
+    cpm_only = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                         normalize_target_sum=5e5, filter_gene_min_cpm_cell=1.0)
+    mv_only = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                        normalize_target_sum=5e5, filter_gene_min_mean_value=0.0)
+    full_keys = set(zip(full["target"].to_list(), full["feature"].to_list()))
+    inter = (set(zip(cpm_only["target"].to_list(), cpm_only["feature"].to_list()))
+             & set(zip(mv_only["target"].to_list(), mv_only["feature"].to_list())))
+    assert full_keys == inter
+
+
+@needs_cuda
+def test_geometric_with_normalize_matches_external(synth_small_sparse):
+    """mean_calc='geometric' + normalize_target_sum='median' matches external
+    scanpy normalize_total(target_sum=None) then geometric de() with no
+    normalization — the geometric reported mean is computed on the NORMALIZED
+    values, same as cpm_normalize+geometric today."""
+    import gpudge
+    import scanpy as sc
+    a = synth_small_sparse
+    a_ext = a.copy()
+    sc.pp.normalize_total(a_ext, target_sum=None)
+    out_ext = gpudge.de(a_ext, groupby="comparison", reference="ntc",
+                        mean_calc="geometric")
+    out_med = gpudge.de(a.copy(), groupby="comparison", reference="ntc",
+                        mean_calc="geometric", normalize_target_sum="median")
+    j = out_ext.join(out_med, on=["target", "feature"], suffix="_m")
+    # log2fc is invariant to the median scale (cancels in the target/ref ratio).
+    lfc_e = j["log2_fold_change"].to_numpy()
+    lfc_m = j["log2_fold_change_m"].to_numpy()
+    fin = np.isfinite(lfc_e) & np.isfinite(lfc_m)
+    np.testing.assert_allclose(lfc_e[fin], lfc_m[fin], rtol=1e-5, atol=1e-7)
+    # p-values differ in the last decimals from float32 multiply ordering;
+    # correlate rather than require bit-equality (see
+    # test_cpm_normalize_matches_external).
+    p_e = j["p_value"].to_numpy()
+    p_m = j["p_value_m"].to_numpy()
+    pf = np.isfinite(p_e) & np.isfinite(p_m)
+    assert pf.sum() > 10
+    corr = np.corrcoef(p_e[pf], p_m[pf])[0, 1]
+    assert corr > 0.99999, f"geometric+median p-value correlation {corr:.6f}"
 
 
 @needs_cuda
@@ -160,9 +282,12 @@ def test_mwu_one_group_n_ref_zero():
 @needs_cuda
 def test_tie_heavy_all_zero_gene_does_not_crash(synth_small_sparse):
     """Zero-variance gene must not break MWU/FDR; with no (new) filter it is kept."""
-    import numpy as np, polars as pl, scipy.sparse as sp
+    import polars as pl
     a = synth_small_sparse.copy()
-    X = a.X.toarray(); X[:, 0] = 0; X[:, 1] = 5; X[:5, 1] = 7
+    X = a.X.toarray()
+    X[:, 0] = 0
+    X[:, 1] = 5
+    X[:5, 1] = 7
     a.X = sp.csr_matrix(X)
     out = de(a, groupby="comparison", reference="ntc", epsilon=0.0)  # keep-all
     p0 = out.filter(pl.col("feature") == "g0")["p_value"].to_numpy()
@@ -175,7 +300,9 @@ def test_zero_mean_gene_dropped_at_zero_kept_at_negative(synth_small_sparse):
     """Escape hatch: 0.0 drops a zero-mean gene; a negative threshold keeps it."""
     import scipy.sparse as sp
     a = synth_small_sparse.copy()
-    X = a.X.toarray(); X[:, 0] = 0; a.X = sp.csr_matrix(X)
+    X = a.X.toarray()
+    X[:, 0] = 0
+    a.X = sp.csr_matrix(X)
     dropped = de(a, groupby="comparison", reference="ntc",
                  filter_gene_min_mean_value=0.0)
     kept = de(a, groupby="comparison", reference="ntc",
@@ -189,7 +316,8 @@ def test_cpm_cell_matches_scanpy_normalize_then_mean(synth_small_sparse):
     import numpy as np
     a = synth_small_sparse.copy()
     X = a.X.toarray().astype(np.float64)
-    L = X.sum(axis=1, keepdims=True); L[L == 0] = 1.0
+    L = X.sum(axis=1, keepdims=True)
+    L[L == 0] = 1.0
     cpm = X / L * 1e6
     comp = a.obs["comparison"].to_numpy()
     ref_mean = cpm[comp == "ntc"].mean(axis=0)
@@ -214,7 +342,8 @@ def test_cpm_bulk_matches_pooled_definition(synth_small_sparse):
     import numpy as np
     a = synth_small_sparse.copy()
     X = a.X.toarray().astype(np.float64)
-    comp = a.obs["comparison"].to_numpy(); L = X.sum(axis=1)
+    comp = a.obs["comparison"].to_numpy()
+    L = X.sum(axis=1)
     ref = comp == "ntc"
     ref_bulk = X[ref].sum(axis=0) / max(L[ref].sum(), 1.0) * 1e6
     targets = sorted(set(comp) - {"ntc"})
@@ -235,9 +364,12 @@ def test_cpm_bulk_matches_pooled_definition(synth_small_sparse):
 @needs_cuda
 def test_zero_denominator_cpm_finite_and_keeps_zero_gene(synth_small_sparse):
     """All-zero cell (L=0) and all-zero gene -> finite CPM math, gene kept w/ keep-all."""
-    import numpy as np, polars as pl, scipy.sparse as sp
+    import polars as pl
     a = synth_small_sparse.copy()
-    X = a.X.toarray(); X[0, :] = 0; X[:, 0] = 0; a.X = sp.csr_matrix(X)
+    X = a.X.toarray()
+    X[0, :] = 0
+    X[:, 0] = 0
+    a.X = sp.csr_matrix(X)
     out = de(a, groupby="comparison", reference="ntc",
              filter_gene_min_cpm_cell=-1.0)         # keep-all, exercise the math
     p0 = out.filter(pl.col("feature") == "g0")["p_value"].to_numpy()
@@ -248,7 +380,7 @@ def test_zero_denominator_cpm_finite_and_keeps_zero_gene(synth_small_sparse):
 @needs_cuda
 def test_zero_denominator_cpm_bulk_all_others_empty_rest():
     """ALL_OTHERS with a group spanning all cells -> rest libtot 0 -> finite."""
-    import numpy as np, anndata as ad, scipy.sparse as sp
+    import anndata as ad
     rng = np.random.default_rng(0)
     X = rng.integers(0, 5, size=(40, 6)).astype(np.float32)
     obs = {"comparison": np.array(["g0"] * 40)}    # single group = everyone
@@ -275,7 +407,9 @@ def test_value_filter_decoupled_from_cpm_normalize(synth_small_sparse):
 def test_cpm_cell_warns_on_fractional_X(synth_small_sparse):
     import scipy.sparse as sp
     a = synth_small_sparse.copy()
-    X = a.X.toarray().astype(np.float32); X[3, 3] += 0.5; a.X = sp.csr_matrix(X)
+    X = a.X.toarray().astype(np.float32)
+    X[3, 3] += 0.5
+    a.X = sp.csr_matrix(X)
     with pytest.warns(UserWarning, match="raw counts"):
         de(a, groupby="comparison", reference="ntc", filter_gene_min_cpm_cell=1.0)
 
@@ -283,7 +417,10 @@ def test_cpm_cell_warns_on_fractional_X(synth_small_sparse):
 @needs_cuda
 def test_cpm_cell_warns_on_dense_fractional_X(synth_small):
     import numpy as np
-    a = synth_small.copy(); X = np.asarray(a.X); X[3, 3] += 0.5; a.X = X
+    a = synth_small.copy()
+    X = np.asarray(a.X)
+    X[3, 3] += 0.5
+    a.X = X
     with pytest.warns(UserWarning, match="raw counts"):
         de(a, groupby="comparison", reference="ntc", filter_gene_min_cpm_cell=1.0)
 
@@ -299,6 +436,8 @@ def test_cpm_cell_no_warn_on_integer_float_X(synth_small_sparse, recwarn):
 def test_value_filter_never_warns_on_fractional_X(synth_small_sparse, recwarn):
     import scipy.sparse as sp
     a = synth_small_sparse.copy()
-    X = a.X.toarray().astype(np.float32); X[3, 3] += 0.5; a.X = sp.csr_matrix(X)
+    X = a.X.toarray().astype(np.float32)
+    X[3, 3] += 0.5
+    a.X = sp.csr_matrix(X)
     de(a, groupby="comparison", reference="ntc", filter_gene_min_mean_value=1.0)
     assert not any("raw counts" in str(w.message) for w in recwarn.list)

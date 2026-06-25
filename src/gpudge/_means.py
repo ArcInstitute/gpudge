@@ -22,6 +22,13 @@ def group_means(
     memory spike. At cell line 2 scale (2 M cells × 4 k genes) a single full-chunk
     cast would be 66 GB on GPU; this loop holds ≤ inner_chunk × n_cells × 8 B
     per inner pass instead.
+
+    ``kind="geometric"`` computes ``expm1(mean(log1p(X)))``, defined only for
+    ``X > -1``. Transforming/validating X is the caller's responsibility
+    (gpudge never mutates X); out-of-domain inputs propagate **deterministically**
+    rather than raising or clamping: ``X < -1`` → ``NaN`` (``log1p`` is NaN),
+    and exactly ``X == -1`` → ``-1.0`` (``log1p(-1) = -inf`` →
+    ``expm1(-inf) = -1.0``). (Pinned by test_geometric_mean_out_of_domain_*.)
     """
     if kind not in MEAN_KINDS:
         raise ValueError(f"kind must be one of {MEAN_KINDS}, got {kind!r}")

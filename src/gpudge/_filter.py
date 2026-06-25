@@ -90,22 +90,23 @@ def x_has_noncount_signal(X, *, k: int = 100_000, tol: float = 1e-6) -> bool:
     return bool(np.any(np.abs(sample - np.rint(sample)) > tol))
 
 
-def _row_scale_needs(cpm_normalize, min_cpm_cell, min_cpm_bulk):
-    """What CPM precompute de() needs: (need_row_sums_np, need_row_scales_t).
+def _row_scale_needs(scale_main, min_cpm_cell, min_cpm_bulk, median_requested):
+    """What CPM/normalization precompute de() needs: (need_row_sums_np,
+    need_row_scales_t).
 
-    Two distinct needs, deliberately NOT conflated:
       - ``need_row_scales_t`` — the GPU per-cell scale tensor (``row_scales`` =
-        1e6/L) plus the per-group row-index tensors (``ref_rows_t`` /
-        ``group_rows_t``). Used ONLY to CPM-scale the MWU/report tensor
-        (``cpm_normalize``) or to form the per-cell-CPM "scaled" unit
-        (``filter_gene_min_cpm_cell``).
+        ``numerator/L``) plus the per-group row-index tensors. Needed to scale
+        the main unit (``scale_main``) or to form the per-cell-CPM "scaled" unit
+        for the filter_gene_min_cpm_cell gate.
       - ``need_row_sums_np`` — the CPU per-cell library sizes. Needed to build
         ``row_scales`` AND for the per-group library totals (``group_libtot``)
-        that pooled-bulk CPM (``filter_gene_min_cpm_bulk``) uses.
+        the bulk-CPM filter consumes AND to compute the median target sum.
 
-    A ``filter_gene_min_cpm_bulk``-only run therefore needs the CPU row sums but
-    NOT the GPU scale/index tensors — avoiding that allocation on large data.
+    ``scale_main`` is ``target_sum is not None`` (normalization scales the test/
+    reported unit). ``median_requested`` is ``normalize_target_sum == 'median'``;
+    it forces the row-sum precompute even when nothing else needs it.
     """
-    need_row_scales_t = bool(cpm_normalize) or (min_cpm_cell is not None)
-    need_row_sums_np = need_row_scales_t or (min_cpm_bulk is not None)
+    need_row_scales_t = bool(scale_main) or (min_cpm_cell is not None)
+    need_row_sums_np = (need_row_scales_t or (min_cpm_bulk is not None)
+                        or bool(median_requested))
     return need_row_sums_np, need_row_scales_t

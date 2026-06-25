@@ -13,6 +13,41 @@ DEFAULT_OUTPUT_COLUMNS = (
     "p_value", "test_statistic", "p_adj",
 )
 
+# Canonical typed schema of the de() output. The dtypes mirror what
+# assemble_dataframe() produces from its numpy inputs (str -> String,
+# {target,ref}_ncells int64 -> Int64, the rest float64 -> Float64); the
+# test suite pins this against a real assemble_dataframe output so the two
+# can't drift. Kept here (next to assemble_dataframe) as the single source
+# of truth so callers building an empty result don't hand-maintain a copy.
+_OUTPUT_SCHEMA: dict[str, pl.DataType] = {
+    "target": pl.String,
+    "feature": pl.String,
+    "target_mean": pl.Float64,
+    "ref_mean": pl.Float64,
+    "target_ncells": pl.Int64,
+    "ref_ncells": pl.Int64,
+    "log2_fold_change": pl.Float64,
+    "p_value": pl.Float64,
+    "test_statistic": pl.Float64,
+    "p_adj": pl.Float64,
+}
+
+
+def empty_output_frame(output_columns: dict[str, str] | None = None) -> pl.DataFrame:
+    """Zero-row DataFrame carrying the canonical de() output schema (correctly
+    typed, **not** all-Null columns), honouring ``output_columns`` the same way
+    ``assemble_dataframe`` does.
+
+    Used for the streaming empty-archive early return so an empty result has the
+    identical schema to a non-empty one — building from empty lists
+    (``{c: [] ...}``) instead yields Null columns that mismatch / error
+    downstream on concat or schema-aligned access.
+    """
+    df = pl.DataFrame(schema=_OUTPUT_SCHEMA)
+    if output_columns is None:
+        return df
+    return df.select(list(output_columns)).rename(output_columns)
+
 
 def assemble_dataframe(
     *,

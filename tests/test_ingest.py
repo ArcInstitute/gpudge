@@ -1,5 +1,4 @@
 # tests/test_ingest.py
-import numpy as np
 import pytest
 from gpudge._ingest import ALL_OTHERS, ingest
 

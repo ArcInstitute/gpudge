@@ -157,3 +157,25 @@ def test_driver_floor_exhaustion_raises():
         raise torch.cuda.OutOfMemoryError("simulated")
     with pytest.raises(RuntimeError, match=r"CUDA OOM at gpu_gene_chunk_size=64"):
         run_gene_chunks_with_recovery(1000, 64, process, oom_recovery=True, floor=64)
+
+
+def test_driver_returns_final_chunk_no_oom():
+    # No OOM: returns the initial chunk unchanged. Lets the streaming driver
+    # carry a (possibly downshifted) width across groups. (ultrareview #43)
+    final = run_gene_chunks_with_recovery(50, 20, lambda a, b: None,
+                                          oom_recovery=True)
+    assert final == 20
+
+
+def test_driver_returns_final_downshifted_chunk():
+    # OOM once at the full width -> halves to 10 and never OOMs again -> the
+    # driver returns 10 so the caller can start the next pass there instead of
+    # rediscovering the downshift. (ultrareview #43)
+    seen = []
+    def process(a, b):
+        seen.append((a, b))
+        if len(seen) == 1:                     # OOM only on the first (20-wide) attempt
+            raise torch.cuda.OutOfMemoryError("simulated")
+    final = run_gene_chunks_with_recovery(40, 20, process,
+                                          oom_recovery=True, floor=1)
+    assert final == 10

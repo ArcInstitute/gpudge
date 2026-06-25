@@ -1,0 +1,65 @@
+name: CI
+
+# CPU test + lint gate for gpudge.
+#
+# What runs here vs. what skips:
+#   - GPU-gated tests (the `needs_cuda` marker in tests/conftest.py) skip on
+#     the CPU runner.
+#   - The shardad streaming suite (tests/test_shard_stream.py) is gated behind
+#     `pytest.importorskip("shardad")`, so the whole file skips without the
+#     private `[streaming]` extra.
+#   - The real-data tests (tests/test_real_data.py) skip when the dataset path
+#     is absent (it always is on CI).
+# So this job goes green on a stock CPU runner with no GPU and without the
+# `[streaming]` extra — meaning no shardad git-SSH dependency is fetched.
+#
+# The `[fast]` extra (numba) IS installed: the numba CSR kernel is a CPU
+# code path, so installing it exercises that code on CI rather than the
+# scipy fallback.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel a superseded run when new commits land on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Install with `uv pip` (NOT `uv sync`): a fresh `uv sync` builds uv's
+      # universal lock, which resolves EVERY source in [tool.uv.sources] —
+      # including the private shardad git-SSH source — even when the
+      # `streaming` extra isn't requested, and the no-SSH runner can't clone it
+      # (Permission denied (publickey)). `uv pip install` does pip-style
+      # resolution of only the requested extras, so shardad (streaming-only) is
+      # never touched. torch resolves from PyPI here (the cu126 source is also
+      # skipped), which is fine: CI is CPU-only and GPU tests skip. `[fast]`
+      # (numba) IS installed so the numba CSR kernel — a CPU code path — is
+      # exercised rather than the scipy fallback.
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[dev,fast]"
+
+      - name: Lint (ruff)
+        run: uv run --no-sync ruff check src/ tests/
+
+      - name: Tests (pytest)
+        run: uv run --no-sync pytest tests/

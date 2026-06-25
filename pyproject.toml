@@ -1,6 +1,6 @@
 [project]
 name = "gpudge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Lightweight GPU-only Mann–Whitney U differential expression."
 readme = "README.md"
 authors = [{ name = "Arc Institute" }]
@@ -40,9 +40,13 @@ torch = [{ index = "pytorch-cu126", marker = "platform_system == 'Linux'" }]
 # shardad is the OPTIONAL `streaming` extra only (the core library takes an
 # in-memory AnnData and never imports shardad). It is hosted privately at
 # ArcInstitute/shardad until PyPI distribution is decided, so this source
-# pins the v0.2.0 tag via SSH for `uv sync --extra streaming`; switch to a
-# PyPI version string once it's published.
-shardad = { git = "ssh://git@github.com/ArcInstitute/shardad.git", rev = "v0.2.0" }
+# pins a commit via SSH for `uv sync --extra streaming`; switch to a PyPI
+# version string once it's published. Pinned to main@35e82bf (v0.2.1.dev)
+# rather than the v0.2.0 tag because the target-aware reader API that
+# de(shard_archive=...) depends on — write_sharded(group_by=, reference=)
+# and ShardedArchive.read_reference/iter_group_shards/read_group — landed
+# after v0.2.0 was tagged and is not yet in a release tag.
+shardad = { git = "ssh://git@github.com/ArcInstitute/shardad.git", rev = "35e82bf4bd3b0b297847fc2c4fee640620ee78b9" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

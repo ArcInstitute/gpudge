@@ -192,3 +192,39 @@ def test_csr_row_sums_dense_fallback():
     dense = np.arange(12, dtype=np.float32).reshape(3, 4)
     got = csr_row_sums(dense)  # dense ndarray -> scipy .sum(axis=1) fallback
     np.testing.assert_allclose(got, dense.sum(axis=1))
+
+
+# --- ultrareview regressions: non-canonical CSR + row bounds (numba path) ---
+
+@pytest.mark.skipif(not HAS_NUMBA, reason="duplicate-index summing differs only on the numba path")
+def test_noncanonical_duplicate_indices_are_summed():
+    """A CSR with duplicate column indices within a row (non-canonical) must be
+    SUMMED, matching scipy's .toarray(). The numba kernel previously did
+    last-write-wins, so on the [fast] path the result silently differed from the
+    scipy fallback. Regression for the ultrareview _csr_dense finding."""
+    # Row 0: col 1 twice (2.0 + 3.0 = 5.0) + col 3 once (4.0). Row 1: col 0 twice.
+    data = np.array([2.0, 3.0, 4.0, 1.0, 1.0], dtype=np.float32)
+    indices = np.array([1, 1, 3, 0, 0], dtype=np.int32)
+    indptr = np.array([0, 3, 5], dtype=np.int32)
+    X = csr_matrix((data, indices, indptr), shape=(2, 4))
+    assert not X.has_canonical_format            # genuinely non-canonical
+    rows = np.array([0, 1], dtype=np.int64)
+    want = X.toarray().astype(np.float32)        # scipy sums duplicates
+    got = csr_rows_col_range_to_dense(X, rows, 0, 4)
+    np.testing.assert_array_equal(got, want)
+    # the pre-allocated (pinned) out= variant must sum too
+    buf = np.full((4, 4), -1.0, dtype=np.float32)
+    got2 = csr_rows_col_range_to_dense(X, rows, 0, 4, out=buf)
+    np.testing.assert_array_equal(got2, want)
+
+
+@pytest.mark.skipif(not HAS_NUMBA, reason="bounds guard protects the boundscheck=False numba kernel")
+def test_out_of_range_row_raises():
+    """Row indices outside [0, n_rows) must raise IndexError (scipy's behaviour)
+    rather than reading indptr out of bounds under boundscheck=False. Regression
+    for the ultrareview _csr_dense finding."""
+    X = csr_matrix(np.eye(5, dtype=np.float32))
+    with pytest.raises(IndexError, match="row index"):
+        csr_rows_col_range_to_dense(X, np.array([0, 5], dtype=np.int64), 0, 5)
+    with pytest.raises(IndexError, match="row index"):
+        csr_rows_col_range_to_dense(X, np.array([-1], dtype=np.int64), 0, 5)

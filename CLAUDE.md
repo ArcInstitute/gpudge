@@ -21,6 +21,9 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
   BH), `_means`, `_ingest`, `_stream`, `_output`, `_csr_dense` (numba CSR
   slicer; optional dep).
 - Optional `[fast]` extra installs `numba` and enables the CSR kernel.
+- `de(shard_archive=<dir>)` streams a shardad target-aware archive (reference
+  resident on GPU); two reference modes (archive reference shard vs external
+  `reference=<AnnData>`).
 
 ## Validated against
 

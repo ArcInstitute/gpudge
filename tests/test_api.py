@@ -28,7 +28,6 @@ def test_de_end_to_end_matches_scipy_ground_truth(synth_small):
     labels = synth_small.obs["comparison"].to_numpy()
     ref_X = X[labels == "ntc"]
     # Spot-check 5 random (guide, gene) pairs
-    rng = np.random.default_rng(0)
     rows = result.sample(n=5, seed=0).to_dicts()
     for r in rows:
         gX = X[labels == r["target"]]
@@ -43,7 +42,9 @@ def test_filter_gene_min_mean_value_drops_low_expression(synth_small):
     """Inject a clearly sub-threshold gene and confirm it is dropped."""
     import numpy as np
     a = synth_small.copy()
-    X = np.asarray(a.X); X[:, 0] = 0.0; a.X = X      # g0 mean 0
+    X = np.asarray(a.X)
+    X[:, 0] = 0.0
+    a.X = X      # g0 mean 0
     full = de(a, groupby="comparison", reference="ntc")
     filt = de(a, groupby="comparison", reference="ntc",
               filter_gene_min_mean_value=1.0)
@@ -257,6 +258,26 @@ def test_de_rejects_negative_epsilon():
         de(_tiny_adata(), groupby="comparison", reference="ntc", epsilon=-1.0)
 
 
+def test_cpm_normalize_and_target_sum_mutually_exclusive():
+    with pytest.raises(ValueError, match="only one"):
+        gpudge.de(_tiny_adata(), groupby="comparison", reference="ntc",
+                  cpm_normalize=True, normalize_target_sum=1e6)
+
+
+@needs_cuda
+def test_normalize_target_sum_bad_string(synth_small):
+    with pytest.raises(ValueError, match="median"):
+        gpudge.de(synth_small, groupby="comparison", reference="ntc",
+                  normalize_target_sum="mean")
+
+
+@needs_cuda
+def test_normalize_target_sum_nonpositive(synth_small):
+    with pytest.raises(ValueError, match="positive"):
+        gpudge.de(synth_small, groupby="comparison", reference="ntc",
+                  normalize_target_sum=0)
+
+
 def test_de_rejects_unknown_output_columns():
     with pytest.raises(KeyError, match="output_columns"):
         de(_tiny_adata(), groupby="comparison", reference="ntc",
@@ -317,7 +338,9 @@ def test_filter_gene_min_mean_value_reads_as_supplied_X(synth_small):
     import numpy as np
     from gpudge import de
     a = synth_small.copy()
-    X = np.asarray(a.X); X[:, 0] = 0.0; a.X = X      # gene g0 all-zero
+    X = np.asarray(a.X)
+    X[:, 0] = 0.0
+    a.X = X      # gene g0 all-zero
     out = de(a, groupby="comparison", reference="ntc",
              filter_gene_min_mean_value=0.5)
     assert "g0" not in set(out["feature"].to_list())
@@ -342,7 +365,8 @@ def test_keep_genes_restricts_features(synth_small):
     import numpy as np
     from gpudge import de
     a = synth_small.copy()
-    mask = np.zeros(a.n_vars, dtype=bool); mask[[1, 3, 5]] = True
+    mask = np.zeros(a.n_vars, dtype=bool)
+    mask[[1, 3, 5]] = True
     out = de(a, groupby="comparison", reference="ntc",
              keep_genes=mask)
     assert set(out["feature"].to_list()) == {"g1", "g3", "g5"}
@@ -362,7 +386,9 @@ def test_filter_gene_all_others_mean_value(synth_small):
     import numpy as np
     from gpudge import de, ALL_OTHERS
     a = synth_small.copy()
-    X = np.asarray(a.X); X[:, 0] = 0.0; a.X = X
+    X = np.asarray(a.X)
+    X[:, 0] = 0.0
+    a.X = X
     out = de(a, groupby="comparison", reference=ALL_OTHERS,
              filter_gene_min_mean_value=0.5)
     assert "g0" not in set(out["feature"].to_list())

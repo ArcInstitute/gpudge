@@ -1,6 +1,5 @@
 # tests/test_mwu.py
 import numpy as np
-import pytest
 import torch
 from scipy.stats import mannwhitneyu
 from gpudge._mwu import mwu_ref
@@ -42,7 +41,8 @@ def test_mwu_ref_matches_scipy_on_synthetic():
     X_t = torch.from_numpy(X).cuda()
     labels_t = torch.from_numpy(labels).cuda()
     U_got, p_got = mwu_ref(X_t, labels_t, n_groups, ref_idx=ref_idx)
-    U_got = U_got.cpu().numpy(); p_got = p_got.cpu().numpy()
+    U_got = U_got.cpu().numpy()
+    p_got = p_got.cpu().numpy()
 
     U_exp, p_exp = _scipy_per_gene_ref(X, labels, n_groups, ref_idx)
 

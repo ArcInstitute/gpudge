@@ -74,7 +74,13 @@ if HAS_NUMBA:
             for j in range(start, end):
                 c = indices[j]
                 if col_start <= c < col_stop:
-                    out[i, c - col_start] = data[j]
+                    # ``+=`` (not ``=``) so duplicate column entries within a
+                    # row accumulate, matching scipy's ``.toarray()``. Canonical
+                    # CSR has at most one entry per (row, col) so this is
+                    # identical to a plain store there; only non-canonical input
+                    # differs (and the scipy fallback already sums). prange is
+                    # over rows, so no two iterations touch the same out[i, :].
+                    out[i, c - col_start] += data[j]
         return out
 
 
@@ -114,7 +120,9 @@ if HAS_NUMBA:
             for j in range(start, end):
                 c = indices[j]
                 if col_start <= c < col_stop:
-                    out[i, c - col_start] = data[j]
+                    # ``+=`` to sum duplicate column entries (see the alloc
+                    # variant above); the sub-view was zeroed just above.
+                    out[i, c - col_start] += data[j]
 
 
 def csr_row_sums(X) -> np.ndarray:
@@ -166,6 +174,15 @@ def csr_rows_col_range_to_dense(
             and isinstance(rows, np.ndarray)):
         rows64 = rows.astype(np.int64, copy=False)
         m = rows64.shape[0]
+        # The kernels run under boundscheck=False, so an out-of-range row would
+        # read indptr out of bounds (silent corruption / segfault) instead of
+        # scipy's IndexError. Validate once here (O(m), cheap vs the gather).
+        if m and (rows64.min() < 0 or rows64.max() >= X.shape[0]):
+            raise IndexError(
+                f"row index out of range: rows span "
+                f"[{int(rows64.min())}, {int(rows64.max())}] but X has "
+                f"{X.shape[0]} rows."
+            )
         if out is not None:
             if out.dtype != np.float32:
                 raise ValueError(

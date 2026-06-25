@@ -56,3 +56,22 @@ def test_unknown_kind_raises():
     labels = torch.zeros(10, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="kind"):
         group_means(X, labels, 1, kind="harmonic")
+
+
+def test_geometric_mean_out_of_domain_propagates_deterministically():
+    """Geometric mean uses log1p, defined only for X > -1. Input domain is the
+    caller's responsibility (gpudge does not transform X); out-of-domain inputs
+    propagate DETERMINISTICALLY rather than raising or clamping:
+      * X < -1  -> NaN          (log1p(X) is NaN)
+      * X == -1 -> -1.0         (log1p(-1) = -inf -> expm1(-inf) = -1.0)
+    Pin BOTH boundaries so they can't drift. (ultrareview #47; CPU tensors —
+    group_means is device-agnostic.)"""
+    # 3 genes: in-domain (>-1), the exact boundary (==-1), out-of-domain (<-1).
+    X = torch.tensor([[2.0, -1.0, -2.0], [4.0, -1.0, -3.0]], dtype=torch.float32)
+    labels = torch.tensor([0, 0], dtype=torch.int32)
+    geo = group_means(X, labels, 1, kind="geometric")
+    assert torch.isfinite(geo[0, 0])           # in-domain (>-1) -> finite
+    assert geo[0, 1].item() == -1.0            # X == -1 -> -1.0 (finite, not NaN)
+    assert torch.isnan(geo[0, 2])              # X < -1 -> NaN (not an exception)
+    # arithmetic mode has no domain restriction (no log1p) — stays finite.
+    assert torch.isfinite(group_means(X, labels, 1, kind="arithmetic")).all()
