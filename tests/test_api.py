@@ -297,6 +297,15 @@ def test_de_rejects_nonfinite_epsilon():
             de(_tiny_adata(), groupby="comparison", reference="ntc", epsilon=bad)
 
 
+def test_de_rejects_nonfinite_epsilon_streaming_dispatch():
+    """Parity with the in-memory check: the streaming dispatch (shard_archive=)
+    rejects non-finite epsilon at the same de()-level guard, which fires before
+    any shardad import — so this runs without the optional streaming extra."""
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite"):
+            de(shard_archive="/nonexistent", epsilon=bad)
+
+
 def test_de_rejects_empty_output_columns():
     """L4: output_columns={} passed validation and yielded a 0-column frame."""
     with pytest.raises(ValueError, match="non-empty"):

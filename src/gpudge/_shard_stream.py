@@ -240,21 +240,32 @@ def stream_de(shard_archive, *, groupby, reference, mean_calc, epsilon,
               keep_genes, device):
     import warnings
 
-    shardad = _import_shardad()
-    arch = shardad.ShardedArchive(shard_archive)
-    n_genes = int(arch.n_vars)
-    var_names = np.asarray(arch.var.index)
-
+    # Archive-free parameter checks first, so a bad call fails fast without
+    # opening the archive (matches de()'s validate-before-dispatch intent and
+    # keeps stream_de() safe to call directly).
     if output_columns is not None:
+        if not output_columns:
+            raise ValueError(
+                "output_columns must be a non-empty dict mapping default column "
+                "names to output names, or None (got an empty dict).")
         unknown = [k for k in output_columns if k not in DEFAULT_OUTPUT_COLUMNS]
         if unknown:
             raise KeyError(
                 f"output_columns keys not in de() output schema: {unknown}. "
                 f"Valid keys: {list(DEFAULT_OUTPUT_COLUMNS)}")
+        dests = list(output_columns.values())
+        if len(set(dests)) != len(dests):
+            raise ValueError(
+                f"output_columns maps multiple keys to the same name: {dests}.")
     if mean_calc not in ("arithmetic", "geometric"):
         raise ValueError(f"mean_calc must be 'arithmetic' or 'geometric', got {mean_calc!r}.")
     if not np.isfinite(epsilon) or epsilon < 0:
         raise ValueError(f"epsilon must be a finite value >= 0, got {epsilon!r}.")
+
+    shardad = _import_shardad()
+    arch = shardad.ShardedArchive(shard_archive)
+    n_genes = int(arch.n_vars)
+    var_names = np.asarray(arch.var.index)
 
     groupby, mode, ref_X, _ = _resolve_streaming(arch, groupby, reference)
     keep_genes_arr = (validate_keep_genes(keep_genes, n_genes)

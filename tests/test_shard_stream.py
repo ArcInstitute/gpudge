@@ -74,15 +74,6 @@ def test_unknown_output_columns_with_archive_raises():
         gpudge.de(shard_archive="/nonexistent", output_columns={"p_values": "p"})
 
 
-def test_nonfinite_epsilon_with_archive_raises():
-    """Streaming epsilon guard mirrors in-memory de(): reject NaN/inf, not just
-    < 0 (the parity gap the ultrareview's epsilon validation left in stream_de).
-    Fires before the archive is opened, so /nonexistent is fine."""
-    for bad in (float("inf"), float("nan")):
-        with pytest.raises(ValueError, match="epsilon must be a finite"):
-            gpudge.de(shard_archive="/nonexistent", epsilon=bad)
-
-
 # ---------------------------------------------------------------------------
 # Task-2: archive fixtures + _resolve_streaming tests
 # ---------------------------------------------------------------------------
