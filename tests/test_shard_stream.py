@@ -305,10 +305,21 @@ def _assert_equiv(df_stream, df_mem):
     for col in ("log2_fold_change", "p_value", "p_adj"):
         x = a[col].to_numpy()
         y = b[col].to_numpy()
+        # Exact-ish equivalence at the in-memory chunk-invariance tolerance,
+        # with equal_nan so NaN positions must align too. Pearson r alone is
+        # invariant under any affine y=a*x+b, so it is blind to a systematic
+        # scale/offset drift (e.g. a normalization constant applied once vs
+        # twice) — exactly the failure mode most plausible in streaming (M2).
         ok = np.isfinite(x) & np.isfinite(y)
+        # Derive the diagnostic max-abs-diff from finite-in-both pairs so the
+        # message can't raise on an all-NaN slice and mask the real assertion.
+        max_abs = float(np.abs(x - y)[ok].max()) if ok.any() else float("nan")
+        assert np.allclose(x, y, rtol=1e-5, atol=1e-7, equal_nan=True), (
+            f"{col}: streaming vs in-memory differ beyond tol (max abs diff {max_abs})"
+        )
         assert ok.any(), f"{col}: no finite pairs to compare (all NaN/inf)"
         r = np.corrcoef(x[ok], y[ok])[0, 1]
-        assert r > 0.9999999, f"{col} pearson {r}"
+        assert r > 0.9999999, f"{col} pearson {r}"  # coarse secondary guard
     assert np.array_equal(a["target_ncells"].to_numpy(), b["target_ncells"].to_numpy())
     assert np.array_equal(a["ref_ncells"].to_numpy(), b["ref_ncells"].to_numpy())
 

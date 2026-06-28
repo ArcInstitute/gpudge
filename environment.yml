@@ -13,7 +13,9 @@
 #
 # For the optional `de(shard_archive=...)` streaming path, also install shardad
 # (private) and switch the extra to [fast,streaming]:
-#   - "shardad @ git+ssh://git@github.com/ArcInstitute/shardad.git@v0.2.0"
+#   - "shardad @ git+ssh://git@github.com/ArcInstitute/shardad.git@35e82bf"
+# (the target-aware reader API landed after the v0.2.0 tag; pin the commit
+#  matching README and pyproject's [tool.uv.sources].)
 name: gpudge
 channels:
   - conda-forge
@@ -22,4 +24,4 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126
-      - "gpudge[fast] @ git+ssh://git@github.com/ArcInstitute/gpudge.git@v0.2.0"
+      - "gpudge[fast] @ git+ssh://git@github.com/ArcInstitute/gpudge.git@v0.3.0"

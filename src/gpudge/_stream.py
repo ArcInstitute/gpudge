@@ -59,10 +59,22 @@ def _auto_gene_chunk_size(
     free memory (both paths are backstopped by the OOM-recovery driver), capped
     at 16 GB; floored at 16 and (when >= 64) rounded down to a multiple of 64.
     """
-    accumulator_bytes_per_gene = (
-        8 * (4 if mean_calc == "geometric" else 3) * n_groups if ref_mode else 0
-    )
-    bytes_per_gene = max(budget_n * 24 + accumulator_bytes_per_gene, 1)
+    if ref_mode:
+        # ref-mode budgets the small pre-sorted reference pool (~24 B/cell/gene:
+        # fp32 value + int64 sort index + fp64 rank + workspace) plus per-chunk
+        # (n_groups, chunk) fp64 accumulators (3 arithmetic / 4 geometric).
+        per_cell_bytes = 24
+        accumulator_bytes_per_gene = (
+            8 * (4 if mean_calc == "geometric" else 3) * n_groups)
+    else:
+        # all_others ranks ALL cells: _rank_with_ties holds ~6 simultaneous full
+        # (n_cells, chunk) f64/int64 arrays + the f32 X_chunk (~64 B/cell/gene,
+        # not 24), and the (n_groups, chunk) f64 rank_sums/U/p accumulators were
+        # previously unbudgeted -- together a ~2.5x under-estimate that risked a
+        # first-chunk OOM + recovery tax on large runs. (L6)
+        per_cell_bytes = 64
+        accumulator_bytes_per_gene = 8 * 3 * n_groups
+    bytes_per_gene = max(budget_n * per_cell_bytes + accumulator_bytes_per_gene, 1)
     # 0.20 of free memory for both paths: each is now backstopped by the
     # OOM-recovery driver (gpudge#27 wrapped all_others too), so an over-estimate
     # downshifts instead of crashing.
