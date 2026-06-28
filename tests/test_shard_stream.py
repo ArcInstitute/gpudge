@@ -74,6 +74,15 @@ def test_unknown_output_columns_with_archive_raises():
         gpudge.de(shard_archive="/nonexistent", output_columns={"p_values": "p"})
 
 
+def test_nonfinite_epsilon_with_archive_raises():
+    """Streaming epsilon guard mirrors in-memory de(): reject NaN/inf, not just
+    < 0 (the parity gap the ultrareview's epsilon validation left in stream_de).
+    Fires before the archive is opened, so /nonexistent is fine."""
+    for bad in (float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="epsilon must be a finite"):
+            gpudge.de(shard_archive="/nonexistent", epsilon=bad)
+
+
 # ---------------------------------------------------------------------------
 # Task-2: archive fixtures + _resolve_streaming tests
 # ---------------------------------------------------------------------------
@@ -310,11 +319,13 @@ def _assert_equiv(df_stream, df_mem):
         # invariant under any affine y=a*x+b, so it is blind to a systematic
         # scale/offset drift (e.g. a normalization constant applied once vs
         # twice) — exactly the failure mode most plausible in streaming (M2).
-        assert np.allclose(x, y, rtol=1e-5, atol=1e-7, equal_nan=True), (
-            f"{col}: streaming vs in-memory differ beyond tol "
-            f"(max abs diff {np.nanmax(np.abs(x - y))})"
-        )
         ok = np.isfinite(x) & np.isfinite(y)
+        # Derive the diagnostic max-abs-diff from finite-in-both pairs so the
+        # message can't raise on an all-NaN slice and mask the real assertion.
+        max_abs = float(np.abs(x - y)[ok].max()) if ok.any() else float("nan")
+        assert np.allclose(x, y, rtol=1e-5, atol=1e-7, equal_nan=True), (
+            f"{col}: streaming vs in-memory differ beyond tol (max abs diff {max_abs})"
+        )
         assert ok.any(), f"{col}: no finite pairs to compare (all NaN/inf)"
         r = np.corrcoef(x[ok], y[ok])[0, 1]
         assert r > 0.9999999, f"{col} pearson {r}"  # coarse secondary guard

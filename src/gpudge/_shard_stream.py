@@ -253,8 +253,8 @@ def stream_de(shard_archive, *, groupby, reference, mean_calc, epsilon,
                 f"Valid keys: {list(DEFAULT_OUTPUT_COLUMNS)}")
     if mean_calc not in ("arithmetic", "geometric"):
         raise ValueError(f"mean_calc must be 'arithmetic' or 'geometric', got {mean_calc!r}.")
-    if epsilon < 0:
-        raise ValueError(f"epsilon must be >= 0, got {epsilon!r}.")
+    if not np.isfinite(epsilon) or epsilon < 0:
+        raise ValueError(f"epsilon must be a finite value >= 0, got {epsilon!r}.")
 
     groupby, mode, ref_X, _ = _resolve_streaming(arch, groupby, reference)
     keep_genes_arr = (validate_keep_genes(keep_genes, n_genes)
