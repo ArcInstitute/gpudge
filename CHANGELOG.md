@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.3.1] — 2026-06-27
+
+Maintenance + licensing release. **No API or numeric changes** to the validated
+Mann–Whitney DE path — every fix touches degenerate/unreachable cases, input
+validation, or metadata (GPU-verified on H100: 220 passed, 1 skipped).
+Distribution remains **Arc-internal** — install from the `v0.3.1` git tag.
+
+### Changed
+
+- **Relicensed BSD-3-Clause → MIT.** Added a top-level `LICENSE` file and
+  reconciled the `pyproject.toml` `license` field to MIT. Copyright holder: Arc
+  Research Institute. (#60)
+
+### Fixed
+
+- Hardening pass — a second multi-agent "ultrareview" addressing all 22
+  confirmed findings (report under
+  `docs/reviews/2026-06-27-gpudge-ultrareview.md`): reject missing (NaN/None)
+  `groupby` labels in both the in-memory and shard-streaming reference paths;
+  degenerate-case sentinels (single-cell `N==1` groups, empty groups); tighter
+  `epsilon` / `output_columns` / `reference` validation; `ALL_OTHERS` and
+  shard-streaming auto-chunk-budget fixes; `/dev/shm` cleanup; and added
+  CPU-runnable MWU-vs-scipy, log2FC, and multi-block test coverage. The
+  validated path is unchanged (numeric fixes touch only degenerate/unreachable
+  cases). (#59)
+- `stream_de()` now enforces epsilon-finiteness parity with `de()` and
+  fail-fast, archive-free input validation — empty / unknown / duplicate
+  `output_columns`, an unknown `mean_calc`, and a non-finite `epsilon` are all
+  rejected before the archive is opened — covered by a CI-runnable parity test.
+  (#60)
+
 ## [0.3.0] — 2026-06-24
 
 Feature + tooling release: native shard-streaming `de(shard_archive=…)`,
@@ -269,7 +300,8 @@ ULP of the CPU baseline on every assertable column.
   scale (237s vs 17s). Stay on v1 archives for cell line 2-scale inputs
   until shardad v0.3 lands an on-GPU read path.
 
-[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ArcInstitute/gpudge/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ArcInstitute/gpudge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ArcInstitute/gpudge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ArcInstitute/gpudge/releases/tag/v0.1.0
