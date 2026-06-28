@@ -97,7 +97,16 @@ def _resolve_streaming(arch, groupby, reference):
             f"groupby column {groupby!r} not found in the reference shard's obs "
             f"(available: {list(ref_adata.obs.columns)})."
         )
-    ref_label_set = set(np.asarray(ref_adata.obs[groupby]).astype(str).tolist())
+    ref_col = ref_adata.obs[groupby]
+    n_missing = int(ref_col.isna().sum())
+    if n_missing:
+        raise ValueError(
+            f"the reference shard's obs[{groupby!r}] has {n_missing} cell(s) "
+            f"with a missing (NaN/None) label; .astype(str) would turn them "
+            f"into a bogus 'nan'/'None' reference label. Re-write the archive "
+            f"without unassigned reference cells. (mirrors the _ingest guard)"
+        )
+    ref_label_set = set(np.asarray(ref_col).astype(str).tolist())
     if reference is not None and str(reference) not in ref_label_set:
         raise ValueError(
             f"reference={reference!r} is not among the archive's reference "
@@ -296,8 +305,13 @@ def stream_de(shard_archive, *, groupby, reference, mean_calc, epsilon,
     n_ref_hint = int(ref_X.shape[0])
     if gpu_gene_chunk_size is None:
         free, _ = torch.cuda.mem_get_info(device)
+        # n_groups=1, not n_targets: streaming Phase 1 holds no (n_groups, chunk)
+        # GPU accumulators — group_chunk_stats returns per-group (chunk,) tensors
+        # copied straight to host. Budgeting for n_targets phantom accumulators
+        # only shrinks the chunk (conservative, never OOMs) and bites when
+        # n_targets >> n_ref. (L7)
         gpu_gene_chunk_size = _auto_gene_chunk_size(
-            free_bytes=free, budget_n=n_ref_hint, n_groups=n_targets,
+            free_bytes=free, budget_n=n_ref_hint, n_groups=1,
             mean_calc=mean_calc, n_genes=n_genes, ref_mode=True)
     chunk = gpu_gene_chunk_size
 
@@ -373,7 +387,12 @@ def stream_de(shard_archive, *, groupby, reference, mean_calc, epsilon,
             # (and to the next shard) instead of restarting at full width. (#43)
             chunk = run_gene_chunks_with_recovery(
                 n_genes, chunk, _chunk, oom_recovery=oom_recovery)
+        # Drop the closure too: _chunk captures Xs as a default arg and persists
+        # at function scope after the inner loop, so `del shard, Xs` alone leaves
+        # a strong ref to the shard's /dev/shm-backed CSR bundle (~1 extra shard
+        # resident until the next iteration / function return). (L8)
         del shard, Xs
+        _chunk = None
 
     # ---- Phase 2: filters → assemble → BH-FDR (same tail as in-memory) ----
     rm_b = np.broadcast_to(ref["ref_mean"], target_mean_acc.shape)

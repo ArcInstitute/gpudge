@@ -51,13 +51,15 @@ def test_auto_chunk_ref_mode_precise():
 
 
 def test_auto_chunk_all_others_uses_020_fraction():
-    # all_others (ref_mode=False) is now wrapped by OOM recovery (gpudge#27),
-    # so it uses the same 0.20 budget as ref-mode (0.18 -> 3136 previously;
-    # 0.20 -> 3456 here).
+    # all_others (ref_mode=False) is wrapped by OOM recovery (gpudge#27) and
+    # uses the 0.20 budget. L6 recalibration: the per-cell coefficient is 64
+    # (not 24) -- _rank_with_ties holds ~6 full (n_cells, ch) f64/int64 arrays
+    # simultaneously -- and the per-chunk (n_groups, ch) f64 accumulators are
+    # now budgeted, so 100k cells / 20 groups -> 1280 (was 3456 at 24 B/cell).
     chunk = _auto_gene_chunk_size(
         free_bytes=39 * 1024**3, budget_n=100_000, n_groups=20,
         mean_calc="arithmetic", n_genes=18_533, ref_mode=False)
-    assert chunk == 3456
+    assert chunk == 1280
 
 
 def test_auto_chunk_scales_inversely_with_reference():

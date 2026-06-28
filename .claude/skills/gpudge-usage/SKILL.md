@@ -56,7 +56,8 @@ result = de(
     cpm_normalize=True,                        # CPM-normalize on GPU inline
 )
 result.write_parquet("de.parquet")
-# columns: target, feature, log2_fold_change, p_value, p_adj
+# columns (10): target, feature, target_mean, ref_mean, target_ncells,
+#   ref_ncells, log2_fold_change, p_value, test_statistic, p_adj
 ```
 
 **One-vs-rest:** `from gpudge import ALL_OTHERS; de(adata, groupby=..., reference=ALL_OTHERS)`.

@@ -126,8 +126,10 @@ if HAS_NUMBA:
 
 
 def csr_row_sums(X) -> np.ndarray:
-    """Per-row sum of a CSR sparse matrix, float64.
+    """Per-row sum of a CSR sparse OR dense matrix, float64.
 
+    (de() also calls this with a dense ``adata.X``, natively or after
+    ``densify_input=True``; the fallback branch handles that.)
     Uses the numba kernel when ``numba`` is installed, otherwise falls back
     to scipy's ``X.sum(axis=1)``. Equivalent results; the numba path is
     massively faster on narrow integer dtypes (uint16/int16/uint8) where

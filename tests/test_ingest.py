@@ -1,4 +1,5 @@
 # tests/test_ingest.py
+import numpy as np
 import pytest
 from gpudge._ingest import ALL_OTHERS, ingest
 
@@ -24,6 +25,17 @@ def test_ingest_missing_groupby_column_raises(synth_small):
 def test_ingest_unknown_reference_raises(synth_small):
     with pytest.raises(ValueError, match="reference"):
         ingest(synth_small, groupby="comparison", reference="not-a-group")
+
+
+@pytest.mark.parametrize("missing", [np.nan, None])
+def test_ingest_missing_groupby_label_raises(synth_small, missing):
+    """NaN/None in the groupby column must be rejected, not silently bucketed
+    into a 'nan'/'None' group (would skew literal-reference and all-others)."""
+    col = synth_small.obs["comparison"].astype(object).to_numpy().copy()
+    col[0] = missing
+    synth_small.obs["comparison"] = col
+    with pytest.raises(ValueError, match="missing"):
+        ingest(synth_small, groupby="comparison", reference="ntc")
 
 
 def test_ingest_all_others_special(synth_small):

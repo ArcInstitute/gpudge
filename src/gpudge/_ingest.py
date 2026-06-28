@@ -44,7 +44,18 @@ def ingest(adata: ad.AnnData, *, groupby: str, reference: str) -> IngestedState:
             f"groupby column {groupby!r} not in adata.obs (have: "
             f"{list(adata.obs.columns)})"
         )
-    raw = adata.obs[groupby].astype(str).to_numpy()
+    col = adata.obs[groupby]
+    n_missing = int(col.isna().sum())
+    if n_missing:
+        raise ValueError(
+            f"adata.obs[{groupby!r}] has {n_missing} cell(s) with a missing "
+            f"(NaN/None) group label. Assign or drop them before calling de(): "
+            f"pandas .astype(str) would otherwise turn them into a literal "
+            f"'nan'/'None' group, silently skewing the comparison (a bogus "
+            f"target in literal-reference mode, or polluting the rest-of-cells "
+            f"reference in ALL_OTHERS mode)."
+        )
+    raw = col.astype(str).to_numpy()
     unique_labels, inverse = np.unique(raw, return_inverse=True)
 
     if reference == ALL_OTHERS:

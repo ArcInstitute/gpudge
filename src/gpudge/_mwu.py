@@ -17,6 +17,12 @@ import torch
 
 SQRT2 = math.sqrt(2.0)
 
+# Tie-term scratch budget (elements): _tie_term_per_gene processes genes in
+# blocks of `_TIE_BLOCK_ELEMS // k` so the O(block x k) int64 run_id + f64 ones
+# scratch stays bounded for a wide reference pool. Exposed as a module constant
+# so tests can force the multi-block path (otherwise block >= n_genes). (L10)
+_TIE_BLOCK_ELEMS = 64_000_000
+
 
 def _rank_with_ties(
     X: torch.Tensor,  # (n_cells, n_genes) float32 or float64, on GPU
@@ -79,7 +85,7 @@ def _tie_term_per_gene(sorted_values: torch.Tensor) -> torch.Tensor:
     # Process genes in blocks so the O(block x k) int64 run_id + f64 ones
     # scratch (~16 B/elem) stays bounded for a wide reference pool — it must
     # not balloon past the gene chunk's own ranking buffers. (Codex review.)
-    block = max(1, min(n_genes, 64_000_000 // k))
+    block = max(1, min(n_genes, _TIE_BLOCK_ELEMS // k))
     for s in range(0, n_genes, block):
         sv = sorted_values[s:s + block]
         new_run = torch.ones_like(sv, dtype=torch.bool)

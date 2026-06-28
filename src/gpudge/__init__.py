@@ -222,7 +222,11 @@ def de(
         always uses arithmetic means.
     epsilon : float, default 1e-9
         Pseudocount inside ``log2((target_mean + epsilon) / (ref_mean + epsilon))``.
-        Default matches ``scanpy.tl.rank_genes_groups``.
+        Default matches ``scanpy.tl.rank_genes_groups``. Must be finite and >= 0.
+        With ``epsilon=0``, a gene whose target and reference means are both 0
+        yields ``NaN`` log2FC and a target-only (ref-mean 0) gene yields ``+inf``;
+        the default ``1e-9`` avoids both. Use a gene filter, or a small positive
+        epsilon, if such genes are present and you need finite log2FC.
     filter_gene_min_mean_value : float | None, default None
         Keep a ``(target, gene)`` row if the per-group arithmetic mean of
         ``adata.X`` **as supplied** — in the target group OR the reference
@@ -402,14 +406,19 @@ def de(
         raise ValueError(
             f"mean_calc must be 'arithmetic' or 'geometric', got {mean_calc!r}."
         )
-    if epsilon < 0:
-        raise ValueError(f"epsilon must be >= 0, got {epsilon!r}.")
+    if not math.isfinite(epsilon) or epsilon < 0:
+        raise ValueError(f"epsilon must be a finite value >= 0, got {epsilon!r}.")
     if cpm_normalize and normalize_target_sum is not None:
         raise ValueError(
             "only one of cpm_normalize / normalize_target_sum may be set "
             "(cpm_normalize=True is equivalent to normalize_target_sum=1e6)."
         )
     if output_columns is not None:
+        if not output_columns:
+            raise ValueError(
+                "output_columns must be a non-empty dict mapping default column "
+                "names to output names, or None (got an empty dict)."
+            )
         unknown = [k for k in output_columns if k not in DEFAULT_OUTPUT_COLUMNS]
         if unknown:
             raise KeyError(
@@ -455,6 +464,16 @@ def de(
     # ---- in-memory path below ----
     if groupby is None or reference is None:
         raise ValueError("de(): in-memory mode requires groupby= and reference=.")
+    # Guard non-str reference BEFORE any `reference == ...` comparison: a
+    # list/array reference would otherwise raise the opaque "truth value of an
+    # array is ambiguous" error. ALL_OTHERS is itself a str, so isinstance
+    # covers the sentinel too. (reference=<AnnData> is only valid for streaming.)
+    if not isinstance(reference, str):
+        raise ValueError(
+            "de(): in-memory reference= must be a group-label string or the "
+            f"ALL_OTHERS sentinel (a string); got {type(reference).__name__}. "
+            "reference=<AnnData> is only valid with shard_archive=."
+        )
     if reference == ALL_OTHERS and mean_calc == "geometric":
         raise NotImplementedError(
             f"reference={ALL_OTHERS!r} with mean_calc='geometric' is not "
@@ -718,7 +737,11 @@ def de(
                                     device=device)
             rank_sums.index_add_(0, labels_t.long(), ranks)
             U = rank_sums - u_offset
-            tie_corr = mn * tie_term[None, :] / (12 * N_t * (N_t - 1))
+            # clamp_min(1.0): for a 1-cell input N_t==1 makes 12*N_t*(N_t-1)==0;
+            # mn is also 0 there, so without the clamp tie_corr is 0/0 == NaN.
+            # Clamped, tie_corr==0 and p degrades to the graceful ~1.0 sentinel
+            # (numerator clamps to 0 below). (L1)
+            tie_corr = mn * tie_term[None, :] / (12 * N_t * (N_t - 1)).clamp_min(1.0)
             var = (base_var - tie_corr).clamp_min(
                 torch.finfo(torch.float64).tiny)
             numerator = (U - mu).abs() - 0.5
@@ -873,8 +896,13 @@ def de(
                     (n_groups, ch), dtype=torch.float64, device=device)
             U_chunk = torch.zeros(
                 (n_groups, ch), dtype=torch.float64, device=device)
-            p_chunk = torch.zeros(
-                (n_groups, ch), dtype=torch.float64, device=device)
+            # NaN (not 0.0) so untouched rows — the skipped ref row and any
+            # empty target group — read as the documented NaN p sentinel rather
+            # than being written into p_acc as p=0.0 (maximally significant).
+            # Active groups overwrite their row below. (L2; latent: np.unique
+            # guarantees observed groups are non-empty, ref row is dropped.)
+            p_chunk = torch.full(
+                (n_groups, ch), float("nan"), dtype=torch.float64, device=device)
             if mean_calc == "geometric":
                 target_mean_chunk = torch.zeros(
                     (n_groups, ch), dtype=torch.float64, device=device)

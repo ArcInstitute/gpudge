@@ -29,17 +29,17 @@ def _scipy_per_gene_ref(X: np.ndarray, labels: np.ndarray, n_groups: int,
     return U, p
 
 
-@needs_cuda
-def test_mwu_ref_matches_scipy_on_synthetic():
-    """Equivalence: torch MWU == scipy MWU on a small synthetic example."""
+def _assert_mwu_ref_matches_scipy(device):
+    """Equivalence: torch MWU == scipy MWU on a small synthetic example.
+    mwu_ref reads X.device, so this runs identically on CPU and CUDA."""
     rng = np.random.default_rng(0)
     n_cells, n_genes, n_groups = 200, 25, 4
     X = rng.negative_binomial(2, 0.5, (n_cells, n_genes)).astype(np.float32)
     labels = rng.integers(0, n_groups, n_cells).astype(np.int32)
     ref_idx = 0
 
-    X_t = torch.from_numpy(X).cuda()
-    labels_t = torch.from_numpy(labels).cuda()
+    X_t = torch.from_numpy(X).to(device)
+    labels_t = torch.from_numpy(labels).to(device)
     U_got, p_got = mwu_ref(X_t, labels_t, n_groups, ref_idx=ref_idx)
     U_got = U_got.cpu().numpy()
     p_got = p_got.cpu().numpy()
@@ -53,17 +53,37 @@ def test_mwu_ref_matches_scipy_on_synthetic():
     np.testing.assert_allclose(p_got[mask], p_exp[mask], rtol=1e-3, atol=1e-6)
 
 
+def test_mwu_ref_matches_scipy_cpu():
+    """CPU-runnable equivalence so the core numerics (tie/continuity/variance)
+    are exercised on the CPU-only CI, not only the @needs_cuda path (M1)."""
+    _assert_mwu_ref_matches_scipy("cpu")
+
+
 @needs_cuda
-def test_mwu_ref_ignores_ref_row():
-    """Output for ref_idx row should be sentinel (NaN p, U=0)."""
+def test_mwu_ref_matches_scipy_cuda():
+    _assert_mwu_ref_matches_scipy("cuda")
+
+
+def _assert_mwu_ref_sentinel(device):
+    """ref_idx row is the documented sentinel: U == 0 and p == NaN."""
     rng = np.random.default_rng(1)
     n_cells, n_genes, n_groups, ref_idx = 100, 10, 3, 1
     X = rng.exponential(1.0, (n_cells, n_genes)).astype(np.float32)
     labels = rng.integers(0, n_groups, n_cells).astype(np.int32)
-    X_t = torch.from_numpy(X).cuda()
-    labels_t = torch.from_numpy(labels).cuda()
+    X_t = torch.from_numpy(X).to(device)
+    labels_t = torch.from_numpy(labels).to(device)
     U, p = mwu_ref(X_t, labels_t, n_groups, ref_idx=ref_idx)
     assert torch.isnan(p[ref_idx]).all()
+    assert (U[ref_idx] == 0).all()   # N4: U=0 half of the sentinel was untested
+
+
+def test_mwu_ref_sentinel_cpu():
+    _assert_mwu_ref_sentinel("cpu")
+
+
+@needs_cuda
+def test_mwu_ref_sentinel_cuda():
+    _assert_mwu_ref_sentinel("cuda")
 
 
 # --- _tie_term_per_gene: Σ(t^3 - t) tie correction (GPU-free; CPU tensors) ---
@@ -93,6 +113,21 @@ def test_tie_term_per_gene_multi_gene():
                                            [3., 3., 3., 3.]]))  # one run -> 60
     assert got.shape == (2,)
     assert [float(x) for x in got] == [12.0, 60.0]
+
+
+def test_tie_term_per_gene_multi_block(monkeypatch):
+    """L10: force the block loop (block < n_genes) and assert it matches the
+    single-block result. Normally block >= n_genes (the 64M-element budget), so
+    the loop always ran once and the stride/run_id-reset/out-slice path was
+    never exercised."""
+    import gpudge._mwu as _mwu
+    rng = np.random.default_rng(7)
+    x = torch.from_numpy(rng.integers(0, 3, (6, 8)).astype(np.float64))  # tie-heavy
+    x, _ = torch.sort(x, dim=1)                       # function expects sorted rows
+    full = _mwu._tie_term_per_gene(x)                 # single block (default budget)
+    monkeypatch.setattr(_mwu, "_TIE_BLOCK_ELEMS", 8)  # 8 // k(=8) -> 1 gene/block
+    multi = _mwu._tie_term_per_gene(x)                # multi-block path (6 blocks)
+    assert torch.allclose(full, multi)
 
 
 def test_tie_term_per_gene_empty_inputs():

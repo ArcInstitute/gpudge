@@ -152,7 +152,8 @@ result = de(
     filter_gene_min_cpm_cell=1.0,   # pdex's per-(group, gene) 1-CPM filter (filters default None)
 )
 result.write_parquet("de_results.parquet")
-# columns: target, feature, log2_fold_change, p_value, p_adj
+# columns (10): target, feature, target_mean, ref_mean, target_ncells,
+#   ref_ncells, log2_fold_change, p_value, test_statistic, p_adj
 ```
 
 > **pdex parity.** The four annotated parameters above are the recipe to match
@@ -211,7 +212,8 @@ result = de(
 
 ## API
 
-See `de()` in `src/gpudge/__init__.py`.
+See `de()` in `src/gpudge/__init__.py`. gpudge also exports the `MeanCalc`
+type alias (the `mean_calc` literal) and `__version__`.
 
 | Kwarg | Default | Meaning |
 |---|---|---|

@@ -290,6 +290,58 @@ def test_de_rejects_duplicate_output_columns():
            output_columns={"target": "x", "feature": "x"})
 
 
+def test_de_rejects_nonfinite_epsilon():
+    """L3: epsilon=nan/inf passed `epsilon < 0` and produced all-NaN log2fc."""
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite"):
+            de(_tiny_adata(), groupby="comparison", reference="ntc", epsilon=bad)
+
+
+def test_de_rejects_empty_output_columns():
+    """L4: output_columns={} passed validation and yielded a 0-column frame."""
+    with pytest.raises(ValueError, match="non-empty"):
+        de(_tiny_adata(), groupby="comparison", reference="ntc",
+           output_columns={})
+
+
+def test_de_rejects_non_string_reference():
+    """L5: a list/array reference gave an opaque 'truth value of an array is
+    ambiguous' error instead of a clear message."""
+    import numpy as np
+    with pytest.raises(ValueError, match="reference"):
+        de(_tiny_adata(), groupby="comparison", reference=["ntc"])
+    with pytest.raises(ValueError, match="reference"):
+        de(_tiny_adata(), groupby="comparison", reference=np.array(["ntc", "x"]))
+
+
+@needs_cuda
+def test_de_all_others_single_cell_p_is_finite():
+    """L1: a 1-cell all_others input made tie_corr divide by N(N-1)=0, giving
+    a NaN p; the denominator clamp must yield the graceful sentinel instead."""
+    import anndata as ad
+    import numpy as np
+    X = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)   # 1 cell, 3 genes
+    adata = ad.AnnData(X=X, obs={"comparison": ["G0"]},
+                       var={"gene_id": ["g0", "g1", "g2"]})
+    adata.var_names = ["g0", "g1", "g2"]
+    df = de(adata, groupby="comparison", reference=gpudge.ALL_OTHERS)
+    assert np.isfinite(df["p_value"].to_numpy()).all()
+
+
+@needs_cuda
+def test_log2fc_matches_closed_form(synth_small):
+    """L9: log2_fold_change must equal log2((target_mean+eps)/(ref_mean+eps)).
+    log2fc is the one output column scipy can't validate, and the README pins
+    it as bit-perfect vs pdex -- so check it against its closed form."""
+    eps = 0.5
+    df = de(synth_small, groupby="comparison", reference="ntc", epsilon=eps)
+    tm = df["target_mean"].to_numpy()
+    rm = df["ref_mean"].to_numpy()
+    expected = np.log2((tm + eps) / (rm + eps))
+    np.testing.assert_allclose(
+        df["log2_fold_change"].to_numpy(), expected, rtol=1e-5, atol=1e-6)
+
+
 # --- ultrareview: integration-level correctness cross-checks vs scipy ---
 
 @needs_cuda
