@@ -1,0 +1,4 @@
+# Generated benchmark outputs (parquets, timing + report JSONs). Regenerate by
+# running the runners; the numbers live in ../RESULTS.md.
+*
+!.gitignore
