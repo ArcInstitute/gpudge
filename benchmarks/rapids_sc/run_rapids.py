@@ -121,6 +121,14 @@ def main() -> None:
                         "Defaults to the data stem + method/transfer.")
     p.add_argument("--outdir", type=Path, default=Path(__file__).parent / "results")
     args = p.parse_args()
+    # On the on-device exact path and in-memory binned path, normalization is
+    # always done on the GPU (rsc.pp.*); --normalize inplace only applies to the
+    # host/dask paths. Reject the combo up front so the timing JSON can't record
+    # a normalization that wasn't used.
+    if (args.method == "wilcoxon_binned" or args.transfer == "device") \
+            and not args.dask and args.normalize == "inplace":
+        p.error("--normalize inplace is not supported for on-device runs "
+                "(device normalizes on the GPU); use --transfer host or --dask.")
     args.outdir.mkdir(parents=True, exist_ok=True)
     stem = Path(args.data).stem
     suffix = (f"{args.method}_{args.transfer}" if args.method == "wilcoxon"

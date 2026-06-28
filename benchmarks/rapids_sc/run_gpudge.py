@@ -61,8 +61,10 @@ def main() -> None:
 
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
-    # filter_gene_min_mean_value=0.0 keeps all genes (matches rapids-sc's
-    # n_genes=all) so the two tools' gene sets line up.
+    # filter_gene_min_mean_value=0.0 drops only (gene,comparison) pairs whose
+    # target AND reference means are both zero (statistically trivial), so
+    # gpudge's gene set is a near-complete strict subset of rapids-sc's
+    # n_genes=all — see RESULTS.md "Correctness" for the small coverage delta.
     out = de(adata, groupby=GROUP_COL, reference=args.reference,
              mean_calc="geometric", epsilon=1e-9,
              filter_gene_min_mean_value=0.0)

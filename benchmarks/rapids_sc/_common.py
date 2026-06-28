@@ -79,7 +79,7 @@ def reshape_rapids_uns(uns: dict) -> pl.DataFrame:
             "target": [g] * len(names),
             # .astype(str) (not str(x)) so bytes-stored gene names decode to
             # 'GENE_A' rather than "b'GENE_A'", which would never join.
-            "feature": np.asarray(names[g]).astype(str).tolist(),
+            "feature": np.asarray(names[g]).astype(str),
             "log2_fold_change": np.asarray(uns["logfoldchanges"][g], dtype="f8"),
             "p_value": np.asarray(uns["pvals"][g], dtype="f8"),
             "p_adj": np.asarray(uns["pvals_adj"][g], dtype="f8"),

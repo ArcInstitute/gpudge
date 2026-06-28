@@ -68,5 +68,7 @@ the combined `<gp>_vs_<rp>.json`.
   both) but includes each tool's CPU→GPU transfer (inside `de_wall_sec` for
   gpudge and for rapids host-streaming). `norm+DE` is the secondary "compute
   from a CPU AnnData" view.
-- gpudge's `de(filter_gene_min_mean_value=0.0)` keeps all genes to match
-  rapids' `n_genes=all`. Single GPU, single run — not a timing distribution.
+- gpudge's `de(filter_gene_min_mean_value=0.0)` drops only all-zero
+  (gene,comparison) pairs (both target and reference mean == 0), so its gene set
+  is a strict subset of rapids' `n_genes=all` (see RESULTS.md for the small
+  coverage delta). Single GPU, single run — not a timing distribution.
