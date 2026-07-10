@@ -1,0 +1,5 @@
+# Code owners for this repo.
+# Every change to the default branch requires an approving review from @alexdobin
+# (enforced via branch protection: "Require review from Code Owners"). Repo admins and
+# org owners can still bypass; non-admin collaborators must get @alexdobin's approval.
+* @alexdobin
