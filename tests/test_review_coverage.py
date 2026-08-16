@@ -441,3 +441,38 @@ def test_value_filter_never_warns_on_fractional_X(synth_small_sparse, recwarn):
     a.X = sp.csr_matrix(X)
     de(a, groupby="comparison", reference="ntc", filter_gene_min_mean_value=1.0)
     assert not any("raw counts" in str(w.message) for w in recwarn.list)
+
+
+def test_refpool_de_core_signature_is_stable():
+    """A downstream consumer drives gpudge._refpool.refpool_de_core directly,
+    behind a hasattr capability shim. de(cell_source=) is the supported
+    replacement, but the private entry must keep working until that consumer
+    migrates -- so changing this signature is a cross-repo break, not a
+    refactor. Update this list deliberately.
+
+    Kinds and defaults are pinned too: names alone would not catch dropping
+    keyword-only status, nor flipping uploader=None / max_group_rows=0.
+    """
+    import inspect
+
+    from gpudge._refpool import refpool_de_core
+
+    empty = inspect.Parameter.empty
+    expected = [
+        ("ref_X", empty), ("target_source", empty), ("targets", empty),
+        ("n_genes", empty), ("var_names", empty), ("device", empty),
+        ("mean_calc", empty), ("epsilon", empty),
+        ("gpu_gene_chunk_size", empty), ("oom_recovery", empty),
+        ("target_sum", empty), ("output_columns", empty),
+        ("filter_gene_min_mean_value", empty),
+        ("filter_gene_min_total_value", empty),
+        ("filter_gene_min_cpm_cell", empty),
+        ("filter_gene_min_cpm_bulk", empty), ("keep_genes_arr", empty),
+        ("warn_noncount", True), ("uploader", None), ("lfc_combos", None),
+        ("taustar_levels", None), ("taustar_iters", None),
+        ("taustar_se", False), ("max_group_rows", 0),
+    ]
+    params = list(inspect.signature(refpool_de_core).parameters.values())
+    assert len(params) == 24
+    assert [(p.name, p.default) for p in params] == expected
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params)

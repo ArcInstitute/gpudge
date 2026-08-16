@@ -17,10 +17,27 @@ def resolve_target_sum(*, cpm_normalize, normalize_target_sum, row_sums):
 
     ``cpm_normalize=True`` is exactly ``normalize_target_sum=1e6``; only one of
     the two may be active. ``normalize_target_sum`` may be a positive number or
-    the string ``"median"`` (scanpy's ``target_sum=None`` behaviour: the median
-    of per-cell total counts over cells with a positive total). ``row_sums`` is
-    the per-cell library-size array; it is required (and only consumed) when
-    ``"median"`` is requested.
+    the string ``"median"``: the median of per-cell total counts **over cells
+    with a positive total**. ``row_sums`` is the per-cell library-size array; it
+    is required (and only consumed) when ``"median"`` is requested.
+
+    On ``"median"`` vs scanpy: this matches scanpy's *dense/Dask* branch and its
+    internal ``_compute_nnz_median`` helper. Its *CSR* branch instead medians
+    over ALL cells, empty ones included (plain ``np.median(counts_per_cell)``)
+    — so the two *can* differ when zero-total cells are present. They need not:
+    row sums ``[0, 10, 10, 20]`` give 10 either way. Since gpudge's sparse paths
+    use CSR, a caller comparing against scanpy on the same object may see a
+    different target. That is **not** a purely cosmetic difference — see the
+    ``de()`` docstring for what moves.
+
+    That CSR/dense split affects scanpy 1.11.2–1.12.3 and the 1.13.0a1
+    prerelease (cut before the fix merged); versions before 1.11.2 never had
+    it, using the positive-cell rule on every path. The fix —
+    scverse/scanpy#4256, which puts the CSR branch on ``_compute_nnz_median``
+    too, converging on the rule implemented here — is merged on scanpy
+    ``main`` and backported to the ``1.12.x`` branch, targeted at 1.12.4, but
+    **no scanpy release carries it as of 1.12.3**. Pinned by
+    ``tests/test_scanpy_median_contract.py``.
     """
     if cpm_normalize and normalize_target_sum is not None:
         raise ValueError(

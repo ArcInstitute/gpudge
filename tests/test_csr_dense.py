@@ -228,3 +228,71 @@ def test_out_of_range_row_raises():
         csr_rows_col_range_to_dense(X, np.array([0, 5], dtype=np.int64), 0, 5)
     with pytest.raises(IndexError, match="row index"):
         csr_rows_col_range_to_dense(X, np.array([-1], dtype=np.int64), 0, 5)
+
+
+# --- ensure_csr: coerce non-CSR sparse X to canonical CSR (#66) ---
+
+def test_ensure_csr_coerces_csc_with_warning():
+    from gpudge._csr_dense import ensure_csr
+    from scipy.sparse import csc_matrix
+    dense = np.array([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0]], dtype=np.float32)
+    with pytest.warns(UserWarning, match="converting to CSR"):
+        out = ensure_csr(csc_matrix(dense), name="adata.X")
+    assert out.format == "csr"
+    assert out.has_sorted_indices
+    np.testing.assert_array_equal(out.toarray(), dense)
+
+
+def test_ensure_csr_coerces_coo_with_warning():
+    from gpudge._csr_dense import ensure_csr
+    from scipy.sparse import coo_matrix
+    dense = np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32)
+    with pytest.warns(UserWarning, match="converting to CSR"):
+        out = ensure_csr(coo_matrix(dense))
+    assert out.format == "csr"
+    np.testing.assert_array_equal(out.toarray(), dense)
+
+
+def test_ensure_csr_csr_passthrough_no_warning():
+    import warnings
+    from gpudge._csr_dense import ensure_csr
+    X = csr_matrix(np.eye(3, dtype=np.float32))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")   # any warning -> test failure
+        out = ensure_csr(X)
+    assert out is X
+
+
+def test_ensure_csr_dense_passthrough_no_warning():
+    import warnings
+    from gpudge._csr_dense import ensure_csr
+    X = np.arange(6, dtype=np.float32).reshape(2, 3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = ensure_csr(X)
+    assert out is X
+
+
+def test_ensure_csr_name_appears_in_message():
+    from gpudge._csr_dense import ensure_csr
+    from scipy.sparse import csc_matrix
+    with pytest.warns(UserWarning, match="reference.X"):
+        ensure_csr(csc_matrix(np.eye(2, dtype=np.float32)), name="reference.X")
+
+
+def test_is_cupy_csr_false_for_scipy_and_dense():
+    from gpudge._csr_dense import is_cupy_csr
+    assert is_cupy_csr(csr_matrix(np.eye(3, dtype=np.float32))) is False
+    assert is_cupy_csr(np.zeros((3, 3), dtype=np.float32)) is False
+    assert is_cupy_csr(None) is False
+
+
+def test_is_cupy_csr_true_for_cupy_like_without_gpu():
+    # Exercise the True branch on a CPU box: a dummy type whose module/name
+    # mimic cupyx's CSR. is_cupy_csr must not import cupy or touch a device.
+    # Build the type already named "csr_matrix" (name set at construction, no
+    # post-hoc __name__ mutation) and only override __module__.
+    from gpudge._csr_dense import is_cupy_csr
+
+    fake_cls = type("csr_matrix", (), {"__module__": "cupyx.scipy.sparse._csr"})
+    assert is_cupy_csr(fake_cls()) is True

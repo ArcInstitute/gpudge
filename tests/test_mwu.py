@@ -135,3 +135,110 @@ def test_tie_term_per_gene_empty_inputs():
     from gpudge._mwu import _tie_term_per_gene
     assert _tie_term_per_gene(torch.empty(0, 5)).shape == (0,)
     assert [float(x) for x in _tie_term_per_gene(torch.empty(3, 0))] == [0.0, 0.0, 0.0]
+
+
+def test_helpers_reproduce_mwu_one_group_exactly():
+    """The extracted helpers must recompose into mwu_one_group bit-for-bit."""
+    import torch
+    from gpudge._mwu import (
+        _bounds, _cross_tie_delta, _p_two_sided, _selfties,
+        _sorted_and_selfties, _tie_term_per_gene, _u1_against, mwu_one_group,
+    )
+    rng = np.random.default_rng(7)
+    n_genes, n_ref, m = 12, 40, 17
+    ref = rng.negative_binomial(2, 0.4, (n_genes, n_ref)).astype(np.float32)
+    grp = rng.negative_binomial(2, 0.4, (n_genes, m)).astype(np.float32)
+    sorted_ref = torch.from_numpy(np.sort(ref, axis=1))
+    group_T = torch.from_numpy(grp)
+    ref_tie = _tie_term_per_gene(sorted_ref)
+
+    u1_exp, p_exp = mwu_one_group(sorted_ref, ref_tie, group_T, n_ref=n_ref)
+
+    group_sorted, gc, run_start = _sorted_and_selfties(group_T)
+    u1_got = _u1_against(sorted_ref, group_T)
+    tie = ref_tie + _cross_tie_delta(sorted_ref, group_sorted, gc, run_start)
+    p_got = _p_two_sided(u1_got, tie, m, n_ref)
+
+    assert torch.equal(u1_got, u1_exp)
+    assert torch.equal(p_got, p_exp)
+
+    # _selfties on an already-sorted block == the composition's tail
+    gc2, rs2 = _selfties(group_sorted)
+    assert torch.equal(gc2, gc) and torch.equal(rs2, run_start)
+
+    # _bounds on same-dtype inputs is exactly torch.searchsorted
+    lo, hi = _bounds(sorted_ref, group_T)
+    assert torch.equal(lo, torch.searchsorted(sorted_ref, group_T, right=False))
+    assert torch.equal(hi, torch.searchsorted(sorted_ref, group_T, right=True))
+
+
+def _bounds_cases():
+    """(ref32, values64, label) covering the whole float32 domain + the edges."""
+    import numpy as np
+    f32 = np.float32
+    rng = np.random.default_rng(17)
+    out = []
+    # random SIGNED finite float32 bit patterns (spec 3.4a domain = either
+    # sign), random tau in [-30, 30], both sides. Magnitudes are drawn below the
+    # inf/nan exponent (0x7F800000) and given a random sign bit, so no NaN can
+    # appear -- NaN violates searchsorted's sorted-sequence contract and has no
+    # MWU ordering.
+    for trial in range(8):
+        def _signed(shape):
+            mag = rng.integers(0, 0x7F800000, shape, dtype=np.uint32)
+            sign = rng.integers(0, 2, shape, dtype=np.uint32) << 31
+            return (mag | sign).view(np.float32)
+        ref = _signed((2, 4000))
+        tgt = _signed((2, 500))
+        assert not np.isnan(ref).any() and not np.isnan(tgt).any()
+        s = 2.0 ** (rng.random() * 60 - 30)
+        out.append((np.sort(ref, axis=1).copy(), tgt.astype(np.float64) * s,
+                    f"signed bit patterns #{trial} s={s:.3e}"))
+    # signed zeros, MIN and MAX subnormal, min normal, max finite, +/-inf
+    tiny = np.finfo(np.float32).tiny
+    max_subnormal = np.nextafter(f32(tiny), f32(0.0))       # largest subnormal
+    edge = np.array([[-np.inf, -1.0, -0.0, 0.0, f32(1.4e-45), max_subnormal,
+                      tiny, 1.0, 2.0, f32(3.4028235e38),
+                      np.inf]], dtype=np.float32)
+    edge = np.sort(edge, axis=1)
+    for tau in (0.0, 0.25, 1.0, 30.0):
+        for s in (2.0 ** -tau, 2.0 ** tau):
+            out.append((edge, edge.astype(np.float64) * s, f"edges tau={tau} s={s:g}"))
+    # exact ties, and values straddling q on both sides
+    ties = np.sort(rng.integers(1, 200, (1, 300)).astype(np.float32), axis=1)
+    out.append((ties, ties[:, ::7].astype(np.float64), "exact ties, s=1"))
+    q = ties[:, ::7].astype(np.float64)
+    out.append((ties, np.nextafter(q, np.inf), "just above q"))
+    out.append((ties, np.nextafter(q, -np.inf), "just below q"))
+    # the spec 3.2b boundary counterexample
+    r, t = f32(2.5243635e-05), f32(3.569989e-05)
+    out.append((np.full((1, 100), r, dtype=np.float32),
+                np.full((1, 100), t, dtype=np.float32).astype(np.float64) * (2.0 ** -0.5),
+                "spec 3.2b boundary counterexample"))
+    return out
+
+
+def _assert_bounds_matches_native(device):
+    """_bounds must be bit-identical to the native (UPCASTING) mixed-dtype
+    torch.searchsorted. The native call is the oracle, not the implementation:
+    it copies the whole boundary to float64 (0.05 ms -> 65.26 ms on a 160 MB
+    reference), which is exactly what _bounds exists to avoid."""
+    import torch
+    from gpudge._mwu import _bounds
+    for ref_np, val_np, label in _bounds_cases():
+        ref = torch.from_numpy(ref_np).to(device)
+        val = torch.from_numpy(val_np).to(device)
+        lo, hi = _bounds(ref, val)
+        assert torch.equal(lo, torch.searchsorted(ref, val, right=False)), label
+        assert torch.equal(hi, torch.searchsorted(ref, val, right=True)), label
+
+
+def test_bounds_matches_native_mixed_dtype_cpu():
+    _assert_bounds_matches_native("cpu")
+
+
+@needs_cuda
+def test_bounds_matches_native_mixed_dtype_cuda():
+    """Run on CUDA too -- this is a claim about rounding, and the CPU and CUDA
+    searchsorted kernels are independent implementations."""
+    _assert_bounds_matches_native("cuda")

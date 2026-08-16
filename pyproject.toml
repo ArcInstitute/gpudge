@@ -1,11 +1,11 @@
 [project]
 name = "gpudge"
-version = "0.3.1"
+version = "0.7.0"
 description = "Lightweight GPU-only Mann–Whitney U differential expression."
 readme = "README.md"
 authors = [{ name = "Arc Institute" }]
 license = { text = "MIT" }
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "anndata>=0.12",
     "hdf5plugin>=6.0.0",
@@ -17,11 +17,43 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "scanpy>=1.12"]
+# ruff is UPPER-BOUNDED on purpose. CI installs fresh (`uv pip install -e
+# ".[dev,fast]"`) and so floats to the newest ruff, while developers run the
+# pinned venv — an unbounded `ruff>=0.6` therefore turns every ruff minor
+# release into a surprise red `test` check on code that did not change. That
+# is exactly what 0.16.0 did: it reports 106 errors (import ordering, literal
+# rewrites) on a tree that 0.15.x calls clean, so `main` went red without a
+# single commit. Bump this bound deliberately, in its own PR, together with
+# whatever fixes the new ruff wants.
+#
+# scanpy is NON-RUNTIME (tests/test_real_data.py, tests/test_review_coverage.py,
+# and the benchmarks/ scripts) and its floor tracks the Python floor, not a
+# feature we need: scanpy >= 1.12 declares `requires-python >= 3.12`, so pinning
+# it there would make `[dev]` unresolvable on 3.11 — the very version this
+# package now supports. 3.11 resolves 1.11.5; 3.12 still gets 1.12.x.
+#
+# pyyaml is declared rather than leaned on: tests/test_python_floor.py parses
+# .github/workflows/ci.yml, and PyYAML is NOT a guaranteed transitive here —
+# torch gates it behind an extra, and it currently arrives only via
+# anndata -> zarr 3 -> donfig, a chain anndata's `zarr>=2.18.7,!=3.0.*` does not
+# require.
+dev = ["pytest>=8", "ruff>=0.6,<0.16", "scanpy>=1.11", "pyyaml>=6"]
 fast = ["numba>=0.59"]
-# Optional: streaming a shardad archive directly (de(shard_archive=...)).
+# Optional: streaming a shardad archive directly (de(archive=...)).
 # The core library takes an in-memory AnnData and does NOT need shardad.
-streaming = ["shardad>=0.2.0"]
+# `streaming` is the CPU-friendly base: pulls no CUDA-only wheels onto host-only
+# / CPU-CI installs. Floor >=0.7.1 -- layout='cell' first shipped in v0.6.0, but
+# gather_rows(n_threads=) (shardad #246), which the cell path uses for every
+# gather, first shipped in v0.7.1; without it a cell gather is ~12-20x slower.
+# The [cell] extra is pyfastpfor, required to even OPEN a codec='pfordelta'
+# archive -- what every production .csad is -- so it belongs here rather than
+# surfacing as a bare ImportError at open time.
+streaming = ["shardad[cell]>=0.7.1"]
+# `streaming-gpu` adds GPU device decode (GroupShard.x_cupy(), shardad #40) via
+# shardad's [gpu] extra (cupy-cuda12x + nvidia-nvcomp-cu12). Recommended install
+# for GPU users on SHARD-layout archives; there is no x_cupy equivalent for the
+# cell codec, so cell-layout archives take the host CSR path either way.
+streaming-gpu = ["shardad[cell,gpu]>=0.7.1"]
 
 [build-system]
 requires = ["hatchling"]
@@ -40,13 +72,20 @@ torch = [{ index = "pytorch-cu126", marker = "platform_system == 'Linux'" }]
 # shardad is the OPTIONAL `streaming` extra only (the core library takes an
 # in-memory AnnData and never imports shardad). It is hosted privately at
 # ArcInstitute/shardad until PyPI distribution is decided, so this source
-# pins a commit via SSH for `uv sync --extra streaming`; switch to a PyPI
-# version string once it's published. Pinned to main@35e82bf (v0.2.1.dev)
-# rather than the v0.2.0 tag because the target-aware reader API that
-# de(shard_archive=...) depends on — write_sharded(group_by=, reference=)
-# and ShardedArchive.read_reference/iter_group_shards/read_group — landed
-# after v0.2.0 was tagged and is not yet in a release tag.
-shardad = { git = "ssh://git@github.com/ArcInstitute/shardad.git", rev = "35e82bf4bd3b0b297847fc2c4fee640620ee78b9" }
+# pins a tagged release via SSH for `uv sync --extra streaming[-gpu]`; switch to
+# a PyPI version string once it's published. Pinned to the v0.7.1 tag (was
+# v0.5.6, which predates layout='cell' entirely -- see gpudge_arc#110).
+# v0.7.1 is the floor for BOTH layouts: it carries the shard path's x_cupy
+# device decode + prefetch reader unchanged from v0.5.6, and adds the cell
+# format (v0.6.0) plus gather_rows(n_threads=) (v0.7.1, shardad #246).
+# NOTE 1: shardad's Rust extension is `optional = true` in its build, so an
+# install with no cargo toolchain silently falls back to the pure-Python cell
+# decoder -- correct on well-formed archives, several times slower.
+# NOTE 2: v0.7.1 does NOT carry shardad #252 (cell writer converts categorical
+# sort keys with .to_numpy(), losing category order, where the shard writer uses
+# .values). Cross-layout byte-identity is therefore scoped to archives written
+# with default ordering.
+shardad = { git = "ssh://git@github.com/ArcInstitute/shardad.git", tag = "v0.7.1" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

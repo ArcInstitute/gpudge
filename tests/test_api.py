@@ -71,6 +71,50 @@ def test_de_all_others_reference(synth_small):
 
 
 @needs_cuda
+def test_de_csc_input_matches_csr_literal_ref(synth_small_sparse):
+    """A CSC adata.X is coerced to CSR (exactly one warning) and yields
+    bit-identical output to the CSR-input run. Literal-reference path mutates
+    adata.X in place (its densify contract). #66"""
+    import warnings as _w
+    from polars.testing import assert_frame_equal
+    csr_adata = synth_small_sparse                 # CSR from the fixture
+    csc_adata = csr_adata.copy()
+    csc_adata.X = csc_adata.X.tocsc()
+    df_csr = de(csr_adata, groupby="comparison", reference="ntc")
+    with _w.catch_warnings(record=True) as rec:
+        _w.simplefilter("always")
+        df_csc = de(csc_adata, groupby="comparison", reference="ntc")
+    coerce = [w for w in rec if "converting to CSR" in str(w.message)]
+    assert len(coerce) == 1
+    keys = ["target", "feature"]
+    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys))
+    assert csc_adata.X.format == "csr"             # coerced in place
+
+
+@needs_cuda
+def test_de_csc_all_others_not_coerced(synth_small_sparse):
+    """reference=ALL_OTHERS must NOT coerce adata.X: the one-vs-rest densify
+    never uses the numba CSR kernel, so coercing a CSC input would only add a
+    per-chunk CSR->CSC round-trip. adata.X stays CSC, no warning, result
+    bit-identical to the CSR run. #66"""
+    import warnings as _w
+    from polars.testing import assert_frame_equal
+    from gpudge import ALL_OTHERS
+    csr_adata = synth_small_sparse                 # CSR from the fixture
+    csc_adata = csr_adata.copy()
+    csc_adata.X = csc_adata.X.tocsc()
+    df_csr = de(csr_adata, groupby="comparison", reference=ALL_OTHERS)
+    with _w.catch_warnings(record=True) as rec:
+        _w.simplefilter("always")
+        df_csc = de(csc_adata, groupby="comparison", reference=ALL_OTHERS)
+    coerce = [w for w in rec if "converting to CSR" in str(w.message)]
+    assert len(coerce) == 0                         # ALL_OTHERS is not coerced
+    assert csc_adata.X.format == "csc"              # left untouched
+    keys = ["target", "feature"]
+    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys))
+
+
+@needs_cuda
 def test_de_legacy_all_others_string_is_deprecated_but_works(synth_small):
     """Pre-v0.1 reference='all_others' still works with a DeprecationWarning."""
     with pytest.warns(DeprecationWarning, match="deprecated"):
@@ -306,6 +350,69 @@ def test_de_rejects_nonfinite_epsilon_streaming_dispatch():
             de(shard_archive="/nonexistent", epsilon=bad)
 
 
+def test_de_rejects_bad_stream_n_workers():
+    """stream_n_workers must be an int >= 1, rejected at the de()-level guard
+    (fires before any shardad import or archive open — runs on shardad-less CPU
+    CI). Lives here, not in test_shard_stream.py, whose module-level
+    importorskip('shardad') would skip it without the streaming extra."""
+    with pytest.raises(ValueError, match="stream_n_workers"):
+        de(shard_archive="/nonexistent", stream_n_workers=0)
+    for bad in (1.5, True):
+        with pytest.raises(TypeError, match="stream_n_workers"):
+            de(shard_archive="/nonexistent", stream_n_workers=bad)
+
+
+def test_de_rejects_bad_stream_prefetch():
+    """stream_prefetch must be an int >= 0 (0 disables prefetch)."""
+    with pytest.raises(ValueError, match="stream_prefetch"):
+        de(shard_archive="/nonexistent", stream_prefetch=-1)
+    for bad in (1.5, True):
+        with pytest.raises(TypeError, match="stream_prefetch"):
+            de(shard_archive="/nonexistent", stream_prefetch=bad)
+
+
+def test_iter_kwargs_serial_and_prefetch():
+    """_iter_kwargs(n_workers, prefetch) is a pure helper (no shardad) — keep it
+    covered on CPU CI. prefetch<=0 -> serial (bare iter_group_shards());
+    prefetch>=1 -> {prefetch, n_workers} for that-many-way decode-ahead."""
+    from gpudge import _shard_stream as ss
+    assert ss._iter_kwargs(16, 0) == {}
+    assert ss._iter_kwargs(16, -1) == {}
+    assert ss._iter_kwargs(16, 2) == {"prefetch": 2, "n_workers": 16}
+    assert ss._iter_kwargs(8, 4) == {"prefetch": 4, "n_workers": 8}
+
+
+def test_should_device_decode_matrix(monkeypatch):
+    """_should_device_decode truth table (pure helper, no shardad/cupy needed —
+    monkeypatched). Lives here, not in test_shard_stream.py, whose module-level
+    importorskip('shardad') would skip it on shardad-less CPU CI. Device decode
+    requires an x_cupy-capable archive (packed schema_version 3 — the v0.5.x
+    default — OR legacy v2-directory 2) AND cupy AND shardad.x_cupy."""
+    from gpudge import _shard_stream as ss
+
+    class _Arch:
+        schema_version = 3                     # v0.5.x packed (the real format)
+
+    a = _Arch()
+    monkeypatch.setattr(ss, "_cupy_available", lambda: True)
+    monkeypatch.setattr(ss, "_x_cupy_available", lambda: True)
+    assert ss._should_device_decode(a) is True     # packed -> device
+
+    a.schema_version = 2                       # legacy v2-directory -> device
+    assert ss._should_device_decode(a) is True
+
+    a.schema_version = 1                       # v1 archive -> host
+    assert ss._should_device_decode(a) is False
+
+    a.schema_version = 3
+    monkeypatch.setattr(ss, "_cupy_available", lambda: False)   # no cupy -> host
+    assert ss._should_device_decode(a) is False
+
+    monkeypatch.setattr(ss, "_cupy_available", lambda: True)
+    monkeypatch.setattr(ss, "_x_cupy_available", lambda: False)  # old shardad -> host
+    assert ss._should_device_decode(a) is False
+
+
 def test_de_rejects_empty_output_columns():
     """L4: output_columns={} passed validation and yielded a 0-column frame."""
     with pytest.raises(ValueError, match="non-empty"):
@@ -461,3 +568,64 @@ def test_min_feature_filter_removed_raises(synth_small):
     with pytest.raises(ValueError, match="filter_gene_min_mean_value"):
         de(synth_small, groupby="comparison", reference="ntc",
            min_feature_filter=1.0)
+
+
+def test_csr_row_sums_accumulates_in_float64_without_numba(monkeypatch):
+    """The non-numba fallback must reduce in float64, not in X.data's dtype.
+
+    scipy's X.sum(axis=1) reduces in the input dtype; a float32 CSR whose row
+    total passes 2**24 then rounds, while the same counts as an integer dtype
+    reduce exactly. The streaming cell path hands gpudge float32 CSR, so this is
+    the difference between two layouts agreeing and disagreeing.
+    """
+    import scipy.sparse as sp
+    from gpudge import _csr_dense as cd
+
+    # One row whose exact total is 2**24 + 1 -- not representable in float32.
+    vals = np.array([2.0 ** 24, 1.0], dtype=np.float32)
+    X = sp.csr_matrix((vals, np.array([0, 1]), np.array([0, 2])), shape=(1, 2))
+    monkeypatch.setattr(cd, "HAS_NUMBA", False)
+    got = cd.csr_row_sums(X)
+    assert got.dtype == np.float64
+    assert got[0] == 2.0 ** 24 + 1.0, f"reduced in float32: {got[0]!r}"
+
+
+def test_archive_and_shard_archive_together_raises():
+    with pytest.raises(ValueError, match="only archive="):
+        gpudge.de(archive="a.csad", shard_archive="b.shad")
+
+
+def test_shard_archive_is_deprecated_alias():
+    """shard_archive= still works but warns. stream_n_workers=0 makes the call
+    fail on archive-free validation, so the test cannot depend on GPU presence
+    or on which error a missing file produces."""
+    with pytest.warns(DeprecationWarning, match=r"use de\(archive="):
+        with pytest.raises(ValueError, match="stream_n_workers"):
+            gpudge.de(shard_archive="/nonexistent/x.shad", stream_n_workers=0)
+
+
+def test_neither_adata_nor_archive_raises_mentions_archive():
+    with pytest.raises(ValueError, match="exactly one of adata= or archive="):
+        gpudge.de()
+
+
+def test_both_adata_and_archive_raises(synth_small):
+    with pytest.raises(ValueError, match="exactly one of adata= or archive="):
+        gpudge.de(synth_small, archive="x.csad")
+
+
+def test_tau_star_se_is_documented_with_its_domain_caveat():
+    """#112: on raw counts the delta=0 tie atom dominates hi-lo, so tau*_se is
+    not a sampling SE there. The caveat must be ON the parameter itself."""
+    doc = de.__doc__
+    assert "tau_star_se : bool" in doc
+    assert "tau*_lo_p0.025" in doc and "tau*_hi_p0.025" in doc
+    assert "tau*_se" in doc
+    # Slice to the END of the parameter block, not a magic character count.
+    # The plan prescribed [:3000], but the docstring it also prescribed puts
+    # `normalize_target_sum` ~3.6k characters in, so that window could never
+    # see it. Widening to a bigger number would instead spill into the NEXT
+    # parameter and stop proving the caveat is on THIS one; the block boundary
+    # proves exactly the intended claim and survives the block growing.
+    block = doc.split("tau_star_se : bool")[1].split("gpu_gene_chunk_size :")[0]
+    assert "normalize_target_sum" in block

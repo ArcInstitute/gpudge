@@ -11,11 +11,14 @@
 # an H100/A100/Hopper GPU; torch's CUDA libraries ship inside the pip wheel, so
 # no conda CUDA toolkit is needed.
 #
-# For the optional `de(shard_archive=...)` streaming path, also install shardad
-# (private) and switch the extra to [fast,streaming]:
-#   - "shardad @ git+ssh://git@github.com/ArcInstitute/shardad.git@35e82bf"
-# (the target-aware reader API landed after the v0.2.0 tag; pin the commit
-#  matching README and pyproject's [tool.uv.sources].)
+# For the optional `de(archive=...)` streaming path, also install shardad
+# (private, shardad[cell]>=0.7.1) and switch the extra to [fast,streaming]:
+#   - "shardad[cell] @ git+ssh://git@github.com/ArcInstitute/shardad.git@v0.7.1"
+# (for GPU device decode use shardad[cell,gpu] via the streaming-gpu extra; pin
+#  the v0.7.1 tag, matching README and pyproject's [tool.uv.sources]. v0.7.1 is
+#  the floor for BOTH archive layouts: v0.5.6 predates layout='cell' entirely,
+#  and gather_rows(n_threads=) -- which the cell path uses for every gather --
+#  first shipped in v0.7.1.)
 name: gpudge
 channels:
   - conda-forge
@@ -24,4 +27,4 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126
-      - "gpudge[fast] @ git+ssh://git@github.com/ArcInstitute/gpudge.git@v0.3.0"
+      - "gpudge[fast] @ git+ssh://git@github.com/ArcInstitute/gpudge.git@v0.7.0"
