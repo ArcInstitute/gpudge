@@ -5,9 +5,10 @@ name: CI
 # What runs here vs. what skips:
 #   - GPU-gated tests (the `needs_cuda` marker in tests/conftest.py) skip on
 #     the CPU runner.
-#   - The shardad streaming suite (tests/test_shard_stream.py) is gated behind
-#     `pytest.importorskip("shardad")`, so the whole file skips without the
-#     private `[streaming]` extra.
+#   - The shardad streaming suites (tests/test_shard_stream.py,
+#     tests/test_cell_stream.py, tests/test_inmem_external_ref_gpu.py) are each
+#     gated behind a module-level `pytest.importorskip("shardad")`, so all three
+#     files skip entirely without the private `[streaming]` extra.
 #   - The real-data tests (tests/test_real_data.py) skip when the dataset path
 #     is absent (it always is on CI).
 # So this job goes green on a stock CPU runner with no GPU and without the
@@ -33,15 +34,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  pytest:
+    # One cell per supported interpreter. 3.11 is the declared floor
+    # (pyproject `requires-python`), 3.12 is the developer pin
+    # (.python-version / environment.yml). tests/test_python_floor.py fails if
+    # this list and the pyproject floor ever drift apart — keep the versions
+    # QUOTED, or YAML turns "3.10" into the float 3.1.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
+      # setup-uv's `python-version` does three things: sets UV_PYTHON, creates
+      # a venv on that interpreter, and activates it for later steps — so there
+      # is deliberately NO separate `uv venv` step below. It also matters for
+      # correctness: the repo ships `.python-version` = 3.12, and without
+      # UV_PYTHON the 3.11 cell's `uv run --no-sync` falls back to uv's "Using
+      # incompatible environment" path.
+      #
+      # `cache-dependency-glob` points the cache key at pyproject.toml because
+      # the defaults (**/uv.lock, **/requirements*.txt) match nothing here —
+      # uv.lock is git-ignored in this repo. No `cache-suffix` is needed: v5's
+      # computeKeys() already interpolates the resolved Python version into the
+      # key, so the two matrix cells never share one.
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          python-version: ${{ matrix.python-version }}
+          cache-dependency-glob: pyproject.toml
 
       # Install with `uv pip` (NOT `uv sync`): a fresh `uv sync` builds uv's
       # universal lock, which resolves EVERY source in [tool.uv.sources] —
@@ -54,12 +78,31 @@ jobs:
       # (numba) IS installed so the numba CSR kernel — a CPU code path — is
       # exercised rather than the scipy fallback.
       - name: Install dependencies
-        run: |
-          uv venv
-          uv pip install -e ".[dev,fast]"
+        run: uv pip install -e ".[dev,fast]"
 
       - name: Lint (ruff)
         run: uv run --no-sync ruff check src/ tests/
 
       - name: Tests (pytest)
         run: uv run --no-sync pytest tests/
+
+  # Branch protection on `main` requires the status check context `test`. The
+  # matrix above publishes `pytest (3.11)` / `pytest (3.12)` instead, so this
+  # job republishes the matrix verdict under the required name. Do NOT rename
+  # it without also updating the required checks in branch protection.
+  #
+  # `if: always()` + an explicit result check is deliberate: with a bare
+  # `needs:` this job would be SKIPPED when the matrix fails, and a skipped
+  # required check does not block a merge the way a failed one does. Testing
+  # for equality with `success` (not inequality with `failure`) makes
+  # `cancelled` and `skipped` fail closed too.
+  test:
+    runs-on: ubuntu-latest
+    needs: pytest
+    if: always()
+    steps:
+      - name: Verify the pytest matrix succeeded
+        run: |
+          result='${{ needs.pytest.result }}'
+          echo "pytest matrix result: $result"
+          [ "$result" = "success" ] || exit 1

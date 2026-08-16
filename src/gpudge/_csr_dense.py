@@ -1,7 +1,7 @@
 """Single-pass CSR (rows, col-range) → dense float32 extractor.
 
 Numba-jitted when ``numba`` is installed; falls back to scipy's two-step
-``X[rows, col_start:col_stop].toarray()`` otherwise. cProfile on cell line 2
+``X[rows, col_start:col_stop].toarray()`` otherwise. cProfile on CCL_2
 identified scipy's ``csr_row_index`` + ``get_csr_submatrix`` + their
 intermediate ``numpy.array`` shells as ~280 s of de() wall (90% of the
 remaining post-FDR-fix bottleneck). One pass + parallel-rows kernel
@@ -11,6 +11,8 @@ Install with ``pip install gpudge[fast]`` (or ``uv sync --extra
 fast``) to enable.
 """
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 from scipy.sparse import issparse
@@ -34,7 +36,7 @@ if HAS_NUMBA:
 
         scipy's ``X.sum(axis=1)`` falls onto ``np.ufunc.reduceat`` which is
         dramatically slower on narrow integer dtypes (no SIMD path:
-        observed ~50× slowdown for uint16 vs float32 on cell line 2 → 292 s of a
+        observed ~50× slowdown for uint16 vs float32 on CCL_2 → 292 s of a
         392 s de() call). The numba loop accumulates in float64 in
         parallel across rows.
         """
@@ -125,6 +127,49 @@ if HAS_NUMBA:
                     out[i, c - col_start] += data[j]
 
 
+def is_cupy_csr(x) -> bool:
+    """True iff ``x`` is a cupy device sparse CSR matrix, WITHOUT importing cupy.
+
+    Decided by module/class name so CPU-only / no-cupy environments never import
+    cupy just to answer the predicate. The streaming device path lazily imports
+    the real cupy helpers (``_csr_dense_gpu``) only after this returns True.
+    """
+    cls = type(x)
+    return (cls.__module__.startswith("cupyx.scipy.sparse")
+            and cls.__name__ == "csr_matrix")
+
+
+def ensure_csr(X, *, name: str = "adata.X", stacklevel: int = 2):
+    """Return ``X`` as canonical (sorted) CSR when it is a non-CSR *sparse*
+    matrix, emitting a one-time ``UserWarning``; dense or already-CSR ``X``
+    passes through unchanged (no warning).
+
+    gpudge's numba fast paths (``csr_row_sums``, ``csr_rows_col_range_to_dense``)
+    are gated on ``X.format == "csr"``; a non-CSR sparse ``X`` (e.g. CSC) would
+    otherwise silently fall back to single-threaded scipy slicing on every
+    ``(group x gene-chunk)`` — minutes vs hours at multi-million-cell scale.
+
+    ``stacklevel`` is forwarded to ``warnings.warn`` so the warning lands on the
+    user's ``de(...)`` call rather than an internal gpudge line. Count the frames
+    from this function to ``de()``'s caller: a direct ``de() -> ensure_csr``
+    caller passes ``3``; ``de() -> inmem_external_ref_de -> ensure_csr`` passes
+    ``4``. The default ``2`` points at whoever calls ``ensure_csr`` directly.
+    """
+    if issparse(X) and X.format != "csr":
+        warnings.warn(
+            f"de(): {name} is a {X.format!r} sparse matrix; converting to CSR "
+            "once for the numba fast path. Pass a csr_matrix to avoid this "
+            "(a non-CSR sparse X otherwise falls back to single-threaded scipy "
+            "slicing per gene-chunk — minutes vs hours at multi-million-cell "
+            "scale).",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+        X = X.tocsr()
+        X.sort_indices()   # keep the coerced matrix canonical for the kernels
+    return X
+
+
 def csr_row_sums(X) -> np.ndarray:
     """Per-row sum of a CSR sparse OR dense matrix, float64.
 
@@ -140,9 +185,31 @@ def csr_row_sums(X) -> np.ndarray:
         out = np.empty(n_rows, dtype=np.float64)
         _csr_row_sums_numba(X.data, X.indptr, out)
         return out
-    # Fallback: scipy. Same code path for sparse and dense X; both expose
-    # .sum(axis=1) returning a (n_rows, 1) or (n_rows,) array we then ravel.
-    return np.asarray(X.sum(axis=1)).ravel().astype(np.float64, copy=False)
+    # Fallback: scipy/numpy. The reduction must accumulate in float64, not in
+    # X.data's dtype: a float32 CSR (what shardad's cell gather_rows returns)
+    # would otherwise round where the same counts as a narrow integer dtype
+    # (what the shard reader can return) stay exact, and the two streaming
+    # layouts would disagree on CPM scales, the median target, and every cpm_*
+    # filter. (#110)
+    #
+    # Passing dtype= to scipy's sparse .sum() is NOT enough -- whether it widens
+    # the accumulator or only the result varies by scipy version. CI caught this
+    # on Python 3.11 (reduced in float32) while 3.12 happened to be fine. So for
+    # sparse X, widen the data ourselves and let scipy reduce a float64 matrix;
+    # indices/indptr are shared, so the transient cost is nnz*8 bytes and the
+    # numba kernel above -- what any large run uses, via the [fast] extra --
+    # never reaches here. numpy's dense .sum(dtype=) does honour the accumulator.
+    if issparse(X):
+        if X.dtype == np.float64:
+            X64 = X
+        elif X.format in ("csr", "csc"):
+            # Share indices/indptr; only `data` is widened.
+            X64 = type(X)((X.data.astype(np.float64), X.indices, X.indptr),
+                          shape=X.shape, copy=False)
+        else:
+            X64 = X.astype(np.float64)      # COO/other: no indptr to share
+        return np.asarray(X64.sum(axis=1)).ravel()
+    return np.asarray(X.sum(axis=1, dtype=np.float64)).ravel()
 
 
 def csr_rows_col_range_to_dense(

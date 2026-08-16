@@ -19,7 +19,7 @@ def group_means(
 
     Accumulation is done in float64 (for precision over many cells), but the
     float32 → float64 cast is sub-chunked across genes to bound the transient
-    memory spike. At cell line 2 scale (2 M cells × 4 k genes) a single full-chunk
+    memory spike. At CCL_2 scale (2 M cells × 4 k genes) a single full-chunk
     cast would be 66 GB on GPU; this loop holds ≤ inner_chunk × n_cells × 8 B
     per inner pass instead.
 

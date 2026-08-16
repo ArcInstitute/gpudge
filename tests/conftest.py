@@ -14,6 +14,13 @@ needs_cuda = pytest.mark.skipif(
     reason="requires CUDA GPU",
 )
 
+# Shared tau grid for the lfc_threshold GPU parity gates. 0.4 is deliberately
+# NON-integer, so the float64 scale factor is irrational-ish and the _bounds
+# boundary correction (spec 3.2b) is exercised on nearly every value; 1.0 is an
+# exact power of two, where the scaling is exact and cross ties are genuine;
+# 0.0 keeps the recombination identity in play.
+LFC_TAUS = [0.0, 0.4, 1.0]
+
 
 def _make_synth(n_cells: int, n_genes: int, n_guides: int,
                 ntc_frac: float = 0.3, seed: int = 0,

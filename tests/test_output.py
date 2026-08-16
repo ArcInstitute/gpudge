@@ -3,8 +3,40 @@ import numpy as np
 import polars as pl
 import pytest
 from gpudge._output import (
-    DEFAULT_OUTPUT_COLUMNS, assemble_dataframe,
+    DEFAULT_OUTPUT_COLUMNS, assemble_dataframe, effect_size_from_u,
 )
+
+
+def test_effect_size_from_u():
+    np.testing.assert_array_equal(
+        effect_size_from_u(
+            np.array([[20.0, 0.0, 10.0]]), np.array([4]), 5),
+        np.array([[1.0, -1.0, 0.0]]),
+    )
+
+    got = effect_size_from_u(
+        np.array([[6.0, 3.0], [20.0, 10.0]]),
+        np.array([2, 4]),
+        5,
+    )
+    np.testing.assert_allclose(
+        got,
+        np.array([[0.2, -0.4], [1.0, 0.0]]),
+    )
+
+    # per-target ref_ncells ARRAY (the ALL_OTHERS case, n = n_cells - m per group)
+    arr = effect_size_from_u(
+        np.array([[10.0, 20.0], [0.0, 8.0]]),   # (2 targets, 2 genes) U
+        np.array([4, 8]),                        # m per target
+        np.array([5, 2]),                        # n per target (array, not scalar)
+    )
+    # target0 m·n=20 -> [2*10/20-1, 2*20/20-1]; target1 m·n=16 -> [2*0/16-1, 2*8/16-1]
+    np.testing.assert_allclose(arr, np.array([[0.0, 1.0], [-1.0, 0.0]]))
+
+    degenerate = effect_size_from_u(
+        np.array([[0.0], [0.0]]), np.array([0, 4]), 5)
+    assert np.isnan(degenerate[0, 0])
+    assert degenerate[1, 0] == -1.0
 
 
 def _stub_arrays(n_guides=3, n_genes=4):
@@ -33,9 +65,11 @@ def test_output_columns_renames_and_selects():
     df = assemble_dataframe(
         **_stub_arrays(),
         output_columns={"target": "guide", "feature": "gene",
-                        "log2_fold_change": "log2fc", "p_adj": "fdr"},
+                        "log2_fold_change": "log2fc",
+                        "Ueffect": "rank_effect", "p_adj": "fdr"},
     )
-    assert df.columns == ["guide", "gene", "log2fc", "fdr"]
+    assert df.columns == ["guide", "gene", "log2fc", "rank_effect", "fdr"]
+    assert df["rank_effect"].to_list() == [0.5] * 12
     assert df.height == 3 * 4
 
 
@@ -143,3 +177,103 @@ def test_empty_output_frame_is_typed_and_matches_assemble():
     assert renamed.columns == ["guide", "p"]
     assert renamed.schema["guide"] == pl.String
     assert renamed.schema["p"] == pl.Float64
+
+
+def test_assemble_dataframe_extra_columns_unfiltered():
+    import numpy as np
+    from gpudge._output import assemble_dataframe
+    n_g, n_f = 3, 4
+    base = dict(
+        target=np.array(["a", "b", "c"]),
+        feature=np.array(["f0", "f1", "f2", "f3"]),
+        target_mean=np.ones((n_g, n_f)), ref_mean=np.ones((n_g, n_f)),
+        target_ncells=np.array([5, 6, 7]), ref_ncells=9,
+        log2_fold_change=np.zeros((n_g, n_f)), p_value=np.zeros((n_g, n_f)),
+        test_statistic=np.zeros((n_g, n_f)), p_adj=np.zeros((n_g, n_f)),
+    )
+    extra = np.arange(n_g * n_f, dtype=np.float64).reshape(n_g, n_f)
+    df = assemble_dataframe(**base,
+                            extra_columns={"tau=+0.5_p": extra})
+    assert "tau=+0.5_p" in df.columns
+    assert df["tau=+0.5_p"].to_numpy().tolist() == \
+        extra.ravel().tolist()
+
+
+def test_assemble_dataframe_extra_columns_respect_flat_keep():
+    """Directional columns must be filtered by the SAME mask as base rows."""
+    import numpy as np
+    from gpudge._output import assemble_dataframe
+    n_g, n_f = 2, 3
+    keep = np.array([[True, False, True], [False, True, False]])
+    base = dict(
+        target=np.array(["a", "b"]),
+        feature=np.array(["f0", "f1", "f2"]),
+        target_mean=np.ones((n_g, n_f)), ref_mean=np.ones((n_g, n_f)),
+        target_ncells=np.array([5, 6]), ref_ncells=9,
+        log2_fold_change=np.zeros((n_g, n_f)), p_value=np.zeros((n_g, n_f)),
+        test_statistic=np.zeros((n_g, n_f)), p_adj=np.zeros((n_g, n_f)),
+    )
+    extra = np.arange(n_g * n_f, dtype=np.float64).reshape(n_g, n_f)
+    df = assemble_dataframe(**base, flat_keep=keep.ravel(),
+                            extra_columns={"tau=-1_x": extra})
+    assert df.height == 3
+    assert df["tau=-1_x"].to_numpy().tolist() == [0.0, 2.0, 4.0]
+
+
+def test_assemble_dataframe_extra_columns_shadowing_a_default_raises():
+    import numpy as np
+    import pytest
+    from gpudge._output import assemble_dataframe
+    n_g, n_f = 2, 2
+    base = dict(
+        target=np.array(["a", "b"]), feature=np.array(["f0", "f1"]),
+        target_mean=np.ones((n_g, n_f)), ref_mean=np.ones((n_g, n_f)),
+        target_ncells=np.array([5, 6]), ref_ncells=9,
+        log2_fold_change=np.zeros((n_g, n_f)), p_value=np.zeros((n_g, n_f)),
+        test_statistic=np.zeros((n_g, n_f)), p_adj=np.zeros((n_g, n_f)),
+    )
+    with pytest.raises(KeyError, match="shadows"):
+        assemble_dataframe(**base,
+                           extra_columns={"p_value": np.zeros((n_g, n_f))})
+
+
+def test_empty_output_frame_carries_extra_names():
+    from gpudge._output import empty_output_frame
+    import polars as pl
+    names = ["tau=+0.5_p", "tau=+0.5_padj"]
+    df = empty_output_frame(extra_names=names)
+    assert df.height == 0
+    for n in names:
+        assert df.schema[n] == pl.Float64
+
+
+def test_fully_filtered_result_keeps_the_populated_schema():
+    """A 0-row result must be typed like a populated one AND like
+    empty_output_frame.
+
+    polars infers dtype from values: a 0-length OBJECT-dtype numpy array gives
+    pl.Object where a non-empty one gives pl.String. adata.var_names.to_numpy()
+    and the ingest label array are both object dtype, so without the empty-case
+    cast in assemble_dataframe a fully-filtered de() result carried
+    target/feature as pl.Object -- mismatching on concat, the exact failure
+    empty_output_frame exists to prevent. Found by the lfc_threshold GPU gate
+    (test_zero_row_result_keeps_full_directional_schema).
+    """
+    import numpy as np
+    from gpudge._output import assemble_dataframe, empty_output_frame
+    n_g, n_f = 2, 3
+    base = dict(
+        target=np.array(["a", "b"], dtype=object),
+        feature=np.array(["f0", "f1", "f2"], dtype=object),
+        target_mean=np.ones((n_g, n_f)), ref_mean=np.ones((n_g, n_f)),
+        target_ncells=np.array([5, 6]), ref_ncells=9,
+        log2_fold_change=np.zeros((n_g, n_f)), p_value=np.zeros((n_g, n_f)),
+        test_statistic=np.zeros((n_g, n_f)), p_adj=np.zeros((n_g, n_f)),
+    )
+    extra = {"tau=+0.5_p": np.zeros((n_g, n_f))}
+    full = assemble_dataframe(**base, extra_columns=extra)
+    none = assemble_dataframe(**base, extra_columns=extra,
+                              flat_keep=np.zeros(n_g * n_f, dtype=bool))
+    assert none.height == 0
+    assert none.schema == full.schema
+    assert none.schema == empty_output_frame(extra_names=list(extra)).schema

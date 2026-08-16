@@ -7,7 +7,7 @@ work:
   1. **counting-sort by group_id** (O(N + G), single-threaded but a
      tight loop with no allocations after the initial counts/cursors).
      ``np.argsort(group_id, kind="stable")`` was ~7 s on a 52.7M-row
-     cell line 2 run; counting-sort is ~0.4 s for the same input.
+     CCL_2 run; counting-sort is ~0.4 s for the same input.
   2. **per-segment BH** (argsort by p, m*p/rank, running-min-from-right,
      clip), parallel across the ~4672 groups. Writes directly into the
      final original-row layout, so no outer inverse-permute pass.
@@ -123,7 +123,7 @@ def bh_per_group(
     """
     # copy=False is a no-op when .numpy() already returns float64/int64
     # (the common case from torch.Tensor.cpu().numpy()); without it,
-    # astype always copies, which on cell line 2 means an extra ~420 MB float64
+    # astype always copies, which on CCL_2 means an extra ~420 MB float64
     # buffer and ~420 MB int64 buffer per call.
     p_np = p.detach().cpu().numpy().astype(np.float64, copy=False)
     g_np = group_id.detach().cpu().numpy().astype(np.int64, copy=False)
@@ -144,7 +144,7 @@ def bh_per_group(
 
     # The numba counting-sort runs with boundscheck=False; an out-of-range
     # group_id would otherwise corrupt memory silently. The cost is one
-    # min + one max over n_not_nan int64 (~50 ms on cell line 2, ~1 % of the function).
+    # min + one max over n_not_nan int64 (~50 ms on CCL_2, ~1 % of the function).
     if n_groups <= 0:
         raise ValueError(
             f"n_groups={n_groups}; must be >= 1 when any rows have non-NaN p."

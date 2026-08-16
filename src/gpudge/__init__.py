@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
+from collections.abc import Callable, Iterable, Sequence
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Literal
 
@@ -14,17 +15,31 @@ import polars as pl
 import scipy.sparse as sp
 import torch
 
-from ._csr_dense import HAS_NUMBA, csr_row_sums, csr_rows_col_range_to_dense
+from ._cell_source import CellGroup, _check_2d
+from ._csr_dense import (
+    HAS_NUMBA, csr_row_sums, csr_rows_col_range_to_dense, ensure_csr,
+)
+from ._gpu_mem import _release_gpu_memory
 from ._ingest import ALL_OTHERS, LEGACY_ALL_OTHERS as _LEGACY_ALL_OTHERS, ingest
+from ._lfc import lfc_base_names, lfc_column_names, normalize_lfc_spec
 from ._means import group_means
 from ._mwu import _rank_with_ties, _tie_term_per_gene
 from ._fdr import bh_per_group
-from ._output import DEFAULT_OUTPUT_COLUMNS, assemble_dataframe
+from ._output import (
+    DEFAULT_OUTPUT_COLUMNS,
+    assemble_dataframe,
+    effect_size_from_u,
+)
 from ._stream import (
     _auto_gene_chunk_size,
+    _pinned_buf_width,
     run_gene_chunks_with_recovery,
 )
 from ._shard_stream import group_chunk_stats
+from ._taustar import (
+    normalize_taustar_iters, normalize_taustar_se, normalize_taustar_spec,
+    taustar_column_names,
+)
 
 try:
     __version__ = _pkg_version("gpudge")
@@ -39,13 +54,13 @@ except PackageNotFoundError:
 if not HAS_NUMBA:
     warnings.warn(
         "gpudge: numba is not installed; falling back to scipy "
-        "for sparse CSR row slicing (~3x slower on cell line 2-scale inputs). "
+        "for sparse CSR row slicing (~3x slower on CCL_2-scale inputs). "
         "Install with `pip install gpudge[fast]` (or "
         "`uv sync --extra fast`) to enable the numba kernel.",
         stacklevel=2,
     )
 
-__all__ = ["de", "ALL_OTHERS", "MeanCalc", "__version__"]
+__all__ = ["de", "ALL_OTHERS", "CellGroup", "MeanCalc", "__version__"]
 
 MeanCalc = Literal["arithmetic", "geometric"]
 
@@ -174,9 +189,16 @@ def _all_others_chunk_keep(
 def de(
     adata: ad.AnnData | None = None,
     *,
-    shard_archive: str | os.PathLike | None = None,
+    archive: str | os.PathLike | None = None,
+    shard_archive: str | os.PathLike | None = None,   # deprecated alias of archive=
+    cell_source: Callable[[], Iterable[CellGroup]] | None = None,
+    targets: Sequence[str] | np.ndarray | None = None,
+    var_names: Sequence[str] | np.ndarray | None = None,
     groupby: str | None = None,
-    reference: str | ad.AnnData | None = None,   # str | ALL_OTHERS sentinel | ad.AnnData | None
+    # cell_source= mode accepts the control pool as a raw matrix. The arms are
+    # spelled out rather than widened to `| Any`: an Any arm admits every type
+    # to a static checker, which is no annotation at all.
+    reference: str | ad.AnnData | np.ndarray | sp.spmatrix | None = None,
     mean_calc: MeanCalc = "arithmetic",
     epsilon: float = 1e-9,
     min_feature_filter=_REMOVED,
@@ -191,6 +213,14 @@ def de(
     filter_gene_min_cpm_cell: float | None = None,
     filter_gene_min_cpm_bulk: float | None = None,
     keep_genes: np.ndarray | None = None,
+    lfc_threshold: float | Iterable[float] | None = None,
+    lfc_threshold_alt: str | Iterable[str] = ("up", "down"),
+    tau_star: float | Iterable[float] | None = None,
+    tau_star_iters: int | None = None,
+    tau_star_se: bool = False,
+    stream_n_workers: int = 16,
+    stream_prefetch: int = 2,
+    release_gpu_memory: bool = True,
 ) -> pl.DataFrame:
     """Per-(target, feature) differential expression on GPU.
 
@@ -204,18 +234,74 @@ def de(
     adata : anndata.AnnData
         Single-cell expression matrix. Dense or sparse CSR X is accepted;
         sparse X is streamed to GPU per gene-chunk.
+    archive : str | os.PathLike
+        Path to a shardad archive to stream instead of passing ``adata``.
+        Both layouts are accepted and dispatched automatically off the
+        archive's own manifest (not its file extension): ``layout='shard'``
+        and ``layout='cell'`` (``.csad``). Requires the optional ``streaming``
+        extra (``shardad[cell]>=0.7.1``). Exactly one of ``adata`` /
+        ``archive`` / ``cell_source`` must be given.
+    shard_archive : str | os.PathLike
+        Deprecated spelling of ``archive``; accepted with a
+        ``DeprecationWarning`` and removed in a future release.
+    cell_source : Callable[[], Iterable[CellGroup]]
+        A callable returning an iterable of ``CellGroup`` -- one per target
+        group -- instead of passing ``adata`` or ``archive``. Use this to feed
+        gpudge cells you read yourself: a consumer already streaming an archive
+        for its own aggregation would otherwise pay a second, unfusable pass
+        over the payload.
+
+        Requires ``targets``, ``var_names``, and a ``reference`` that is the
+        control pool itself (an AnnData or a cells x genes matrix) -- a group
+        label and ``ALL_OTHERS`` are both rejected, since there is no obs
+        column to resolve them against. An AnnData reference must have
+        ``var_names`` equal to ``var_names`` element-for-element. ``groupby``
+        is unused: the source decides the grouping.
+
+        **May be called more than once**, and must yield the same groups each
+        time. Nothing calls it twice today, but the contract reserves it so
+        ``normalize_target_sum='median'`` -- which needs a row-sums pre-pass --
+        can be added later without breaking one-shot sources. That spelling
+        currently raises ``NotImplementedError``; pass the target as a number.
+
+        **Pin ``gpu_gene_chunk_size`` if your groups are large.** The automatic
+        gene-chunk sizer models the target working set from the largest group's
+        cell count, which a source cannot report without being drained -- so in
+        this mode it sizes as if that term were zero and can pick a chunk that
+        is too large. With the default ``oom_recovery=True`` that costs a
+        downshift; with ``oom_recovery=False`` it fails outright.
+
+        ``densify_input``, ``stream_n_workers`` and ``stream_prefetch`` are
+        ignored in this mode.
+    targets : Sequence[str]
+        The ordered target labels, one per group the source yields. Defines the
+        output row order, so it need not match yield order. Must be non-empty
+        and free of duplicates. Every label must be yielded exactly once -- a
+        missing one raises rather than emitting an all-zero row. Used only with
+        ``cell_source``.
+    var_names : Sequence[str]
+        The gene axis, shared by every yielded group and by ``reference``. The
+        gene count is ``len(var_names)``. Used only with ``cell_source``.
     groupby : str
         Column in ``adata.obs`` that defines the groups (e.g. guide identity).
-    reference : str | anndata.AnnData | None
+    reference : str | anndata.AnnData | numpy.ndarray | scipy.sparse matrix | None
         Name of the reference group in ``adata.obs[groupby]``, OR the
         ``ALL_OTHERS`` sentinel (``"__all_others__"``) for 1-vs-rest
         comparisons. The pre-v0.1 spelling ``"all_others"`` is still
         accepted with a ``DeprecationWarning`` and will be removed in
         a future release; pass ``ALL_OTHERS`` (or the new string) instead.
-        When streaming (``shard_archive=``), ``reference`` may instead be an
-        ``AnnData`` external control pool (Mode 2). If the archive also
-        designates its own reference shard, the external pool wins and the
-        archive's reference shard is ignored (a ``UserWarning`` is emitted).
+        ``reference`` may instead be an ``AnnData`` external control pool: the
+        pool is ranked resident-sorted on GPU with **no target-reference
+        concatenation** — every group in ``adata.obs[groupby]`` is a target,
+        each ranked against the pool. Supported on **both** the in-memory path
+        (``adata=``) and the streaming path (``archive=``); results are
+        bit-identical between the two on the same cells. ``reference.var_names``
+        must equal ``adata`` / the archive gene axis in order. (Streaming only:
+        if the archive also designates its own archive reference pool, the external
+        pool wins and the archive reference pool is ignored with a ``UserWarning``.)
+        With ``cell_source=`` the pool may also be a bare cells x genes matrix,
+        and a group name / ``ALL_OTHERS`` is rejected — there is no ``obs``
+        column to resolve them against.
     mean_calc : {"arithmetic", "geometric"}, default "arithmetic"
         How ``target_mean`` and ``ref_mean`` (and the log2 fold change derived
         from them) are computed. Independent of any active gene filter, which
@@ -262,6 +348,203 @@ def de(
         hatch when ``adata.X`` is not in raw counts and you want to supply a
         pre-computed inclusion mask instead of (or in addition to) the
         ``filter_gene_*`` thresholds.
+    lfc_threshold : float | Iterable[float] | None, default None
+        Effect-size floor in **log2 fold-change units** (τ ≥ 0, ≤ 30). When set,
+        `de()` additionally reports one-sided Mann–Whitney p-values against
+        the composite nulls ``H0: log2FC <= +τ`` (``up``) and
+        ``H0: log2FC >= -τ`` (``down``), testing them at the rank level: the
+        target is compared against ``reference * 2**(±τ)``. Any FINITE iterable
+        -- list, tuple, ndarray, generator -- evaluates a whole τ grid in ONE
+        pass, sharing all the expensive
+        τ-independent work. The two-sided ``p_value`` / ``Ueffect`` /
+        ``p_adj`` columns are always emitted unchanged. Not supported with
+        ``reference=ALL_OTHERS``.
+
+        Output columns use ``tau=<±τ>_{p,Ueffect,padj}``, where the sign of τ
+        encodes direction: ``+`` is up (``H0: log2FC <= +τ``) and ``-`` is
+        down (``H0: log2FC >= -τ``). Columns are emitted by ascending |τ|,
+        with down (``-``) before up (``+``) at each magnitude. Each
+        (τ, direction) is its own BH family. Each directional ``Ueffect`` is
+        ``2A − 1`` for that direction's shifted comparison.
+
+        **Three caveats you must read:**
+
+        1. The test and ``Ueffect`` are rank-based while
+           ``log2_fold_change`` is a mean-ratio, so their signs can flatly
+           contradict each other on skewed or heavy-tailed genes — a gene can
+           have negative ``Ueffect`` while its ``log2_fold_change`` is strongly
+           positive. Do NOT assume the rank direction equals the mean-ratio
+           direction.
+        2. τ is applied as a multiplicative shift, and ``0 * 2**τ == 0``, so
+           the shift moves only the nonzero entries. On high-dropout genes the
+           effective floor is weaker than τ suggests; ``lfc_threshold=0.5`` is
+           NOT "drop everything with |log2FC| < 0.5".
+        3. p-values are a normal approximation (matching
+           ``scipy.stats.mannwhitneyu(method='asymptotic')``), not exact, and
+           are unreliable for groups with only a handful of cells. They are also
+           **not guaranteed monotone in τ**: the tie correction changes
+           discontinuously where exact target/reference ties appear or vanish,
+           so a directional p can dip slightly as τ grows. The *statistic* is
+           monotone; the p-value is only monotone away from tie transitions.
+
+        The base ``Ueffect`` is the signed rank-biserial correlation / Cliff's
+        delta ``2A − 1 ∈ [−1, 1]`` for the raw comparison, where its sign is
+        the rank direction of change (positive means target ranks above the
+        reference). Recover the probability of superiority / AUC as
+        ``A = (Ueffect + 1) / 2 ∈ [0, 1]``.
+
+        A two-sided threshold test is deliberately not offered. If you need
+        one, combine as ``min(1.0, 2 * min(p_up, p_down))``. Taking plain
+        ``min(p_up, p_down)``, or picking the direction from the observed sign
+        of ``log2_fold_change``, is anticonservative — it is post-hoc selection
+        from the same data.
+
+        **Linear-scale assumption.** τ is applied as a ``2**τ`` multiplicative
+        shift, which is correct when ranks are on a linear count/CPM scale (the
+        default, or ``cpm_normalize=True``). If you pre-log-transform ``X`` the
+        shift should be additive instead, and ``log2_fold_change`` is already
+        inconsistent in that case — pairing log-input ranking with this API is
+        discouraged.
+
+        **Memory.** A τ grid widens the result by ``3 × len(τ) × len(alt)``
+        Float64 columns — that is the dominant cost. GPU memory grows only by
+        the per-(τ, direction) result accumulators (the shift is applied to the
+        target transiently, so no scaled reference is ever held resident); the
+        auto chunk sizer accounts for them and will shrink the gene chunk
+        somewhat.
+    lfc_threshold_alt : str | Iterable[str], default ("up", "down")
+        Which directional tests to compute; values from ``{"up", "down"}``.
+        Ignored when ``lfc_threshold is None``. Computing only one direction
+        halves the added kernel work. Order does not matter — columns are always
+        emitted ``down`` before ``up`` within each |τ|.
+
+    tau_star : float | Iterable[float] | None, default None
+        One-sided ``p_dir`` levels in the OPEN interval (0, 1). For each level
+        ``q`` and each (target, gene), emits ``tau*_p<q>``: the **signed** log2
+        shift at which the gene crosses ``p_dir = q``. The gene's direction is
+        fixed once, by ``sign(Ueffect)``; the returned value is that direction's
+        crossing, and its own sign is a result, not a restatement of the
+        direction -- see **On sign** below.
+
+        ``q = 0.5`` is the **Hodges-Lehmann log2 shift**, the effect size the
+        rank test actually estimates, and is depth-invariant. Any smaller ``q``
+        is a one-sided confidence bound on it: the largest floor the gene
+        survives at that level.
+
+        **``q = 0.05`` is a one-sided 95% bound, i.e. the endpoint of a
+        two-sided 90% interval.** The endpoint matching an ``alpha = 0.05``
+        two-sided call is ``q = 0.025``, and only there does
+        ``tau*_p0.025 > 0`` mean "called at alpha = 0.05 with floor tau = 0".
+
+        **On sign.** At ``q = 0.5`` -- the point estimate -- ``sign(tau*_p0.5)``
+        agrees with ``sign(Ueffect)``, so unlike ``log2_fold_change`` the effect
+        size cannot contradict the test. Two caveats. (a) The agreement is not
+        exact at zero: the continuity correction puts the up and down levels at
+        ``mu + 0.5`` and ``mu - 0.5``, giving signed ``tau*`` a half-pair
+        discontinuity there, so a gene whose crossing lands on that plateau has
+        ``|tau*|`` at the bisection's resolution floor with an arbitrary sign.
+        The effect is zero either way, and the gap shrinks as ``m*n`` grows.
+        (b) **A bound at ``q < 0.5`` may legitimately have the opposite sign to
+        ``Ueffect``** -- that is what a confidence bound means. An up gene that
+        is not significant at ``q`` has ``tau*_p<q> < 0``. Compare a bound to
+        the ``q = 0.5`` estimate, never to zero-crossing alone.
+
+        ``+/-inf`` is a RESULT, not an error: the confidence-bound endpoint is
+        unbounded, which happens on zero-heavy genes and on genes absent from
+        one side. NaN means undefined -- an empty group, an empty reference, or
+        a gene that is zero on both sides. Not supported with
+        ``reference=ALL_OTHERS``.
+
+        **Input domain.** Like the log2 ratio it estimates, ``tau*`` is defined
+        for **finite, non-negative** ``X`` -- the expression counts gpudge is
+        built for. Negative values invert the monotonicity the bisection relies
+        on and infinities do not move under a finite scaling, so neither is
+        rejected but neither yields a meaningful ``tau*``. The base ``p_value``
+        and ``Ueffect`` columns, being pure rank statistics, are unaffected.
+
+        **On raw counts ``tau*`` measures almost nothing -- normalize first.**
+        The modal pairwise log2 ratio is exactly 0, because ``T_i == R_j`` is
+        common for small integers, so most genes land on a tie atom at zero
+        rather than on a resolvable shift. Measured on a 1.27M-cell production
+        archive: 87.9% of finite ``tau*`` lie within 1e-5 of zero and only
+        6.0% of rows reach ``|tau*| >= 0.01``. ``normalize_target_sum``
+        collapses that plateau to 0.02% and lifts usable rows to 46.8%. Use
+        library-size normalization before reading ``tau*`` as an effect size.
+
+        See ``tau_star_se`` for what the same atom does to the interval width,
+        and for a standard error on the ``q = 0.5`` point estimate.
+
+    tau_star_iters : int | None, default None
+        Bisection steps per level (default 20), which puts the residual well
+        under 1e-4 in log2 units. Used only when ``tau_star`` is set, but
+        validated regardless -- ``de(tau_star=None, tau_star_iters=0)`` raises.
+
+    tau_star_se : bool, default False
+        Emit a standard error for the ``tau*`` point estimate. Requires
+        ``tau_star``; ``tau_star_se=True`` with ``tau_star=None`` raises. Adds
+        three float64 columns after the ``tau*_p<level>`` block:
+
+        * ``tau*_lo_p0.025``, ``tau*_hi_p0.025`` -- the endpoints of the
+          nominal 95% two-sided interval for the log2 shift. Each inverts a
+          **one-sided** test at ``p_dir = 0.025``, so the pair has nominal
+          ``1 - 2*0.025`` coverage. Nominal, not guaranteed: the kernel inverts
+          a normal approximation, so finite-sample coverage on discrete counts
+          is not established -- the same standing every asymptotic
+          Mann-Whitney interval has.
+        * ``tau*_se`` -- ``(hi - lo) / (2 * z)`` where
+          ``z = Phi^-1(0.975) = 1.959964...``, in log2 units.
+
+        **``0.5`` is added to the level set if absent**, so ``tau*_p0.5`` --
+        the estimate the SE belongs to -- is always in the default output. The
+        emitted level set can therefore be larger than the one requested.
+        (``output_columns`` can still project it away, like any column.)
+
+        A rank-inversion estimator has no finite-sample, tuning-free variance
+        obtainable from the quantities this kernel computes, so the SE is
+        backed out of an interval width. The level it is measured at is fixed
+        internally and deliberately not a parameter: at ``q = 0.5`` the
+        quantile is 0 and the endpoint gap is the ``+/-0.5`` continuity
+        correction -- a discretization artifact, not a confidence width.
+
+        **The interval is often strongly asymmetric**, and ``tau*_se``
+        collapses it to one number by construction -- it is a normal-equivalent
+        interval-width SE, not in general the sampling standard error of the
+        Hodges-Lehmann estimator. Where ``hi - tau*_p0.5`` and
+        ``tau*_p0.5 - lo`` differ materially, read the endpoints.
+
+        **``tau*_se`` is ``+inf`` whenever either endpoint is unbounded, which
+        is common.** Unboundedness comes from zeros, so small or zero-heavy
+        target groups report ``+inf`` routinely -- consumers doing
+        inverse-variance weighting should treat it as zero weight rather than
+        dropping the row. The endpoints stay informative when the SE does not.
+        A gene whose rank statistic no finite shift can move -- an all-zero
+        target, or an all-zero reference -- reports one of three unbounded
+        readings: ``(+inf, +inf)`` (unbounded above), ``(-inf, +inf)``
+        (unidentified) or ``(-inf, -inf)`` (unbounded below), according to
+        where its statistic falls relative to the two test levels. Which one
+        is **not** determined by which side the zeros are on: ``T=[0]`` vs
+        ``R=[1]`` is unidentified, while ``T=[0,0,0]`` vs ``R=[1,2,3,5]`` is
+        unbounded below. NaN means undefined, matching ``tau*``: an empty
+        group, an empty reference, or a gene that is zero on both sides. The
+        endpoint columns are exactly the two branches of ``tau*_p0.025``
+        reported separately, so those never disagree. That relation holds at
+        ``q = 0.025`` only -- every other level is a different root.
+
+        **Domain caveat, sharper than ``tau_star``'s.** The raw-counts tie atom
+        quantified under ``tau_star`` does not merely flatten the point
+        estimate here: that atom, not sampling variability, then dominates
+        ``hi - lo``. Use library-size normalization
+        (``normalize_target_sum``) before reading either ``tau*`` or
+        ``tau*_se`` as an effect size.
+
+        Not the SE of ``log2_fold_change`` -- different estimand -- and not
+        comparable to a negative-binomial GLM's ``lfcSE`` beyond the shape of
+        the pair. Not supported with ``reference=ALL_OTHERS`` (inherited from
+        ``tau_star``).
+
+        Costs two extra bisections for the endpoints -- ~150 s on top of a
+        ~270 s three-level run at 1.27M cells -- plus one more if ``0.5`` has
+        to be auto-inserted.
 
     gpu_gene_chunk_size : int | None, default None
         Number of genes per GPU pass. ``None`` auto-picks from free device
@@ -282,7 +565,7 @@ def de(
         dense numpy array before the chunk loop (i.e. ``adata.X =
         adata.X.toarray()``). The sparse matrix is dropped after this point.
         Trades n_cells × n_genes × 4 bytes of host RAM (~153 GB steady-state
-        for cell line 2; up to ~310 GB peak during the in-place sparse→dense swap) for
+        for CCL_2; up to ~310 GB peak during the in-place sparse→dense swap) for
         ~30-40% faster per-chunk per-group slicing (numpy fancy indexing
         instead of repeated CSR slicing). The caller must be OK with the
         sparse → dense replacement; pass ``adata.copy()`` first to preserve
@@ -290,6 +573,9 @@ def de(
         the sparse first (e.g. holding both in separate variables) makes this
         slower not faster, because both representations coexist; we do the
         replacement inside de() so the rebind drops the sparse refcount to 0.
+        Not supported together with an AnnData ``reference=`` (raises
+        ``ValueError``); the external reference is ranked resident on the GPU,
+        not densified in place.
     cpm_normalize : bool, default False
         If True, normalize each cell to 1e6 total counts on the fly, inside
         the chunk loop. Row sums are computed once over the full X before
@@ -306,7 +592,30 @@ def de(
         ``scanpy.pp.normalize_total(adata, target_sum=N)``. The string
         ``"median"`` normalizes to the median of per-cell total counts over
         cells with a positive total — scanpy's default
-        ``normalize_total(target_sum=None)``. ``cpm_normalize=True`` is exactly
+        ``normalize_total(target_sum=None)`` as its dense/Dask branch implements
+        it. Caveat: scanpy's CSR branch medians over ALL cells, empty ones
+        included, so the two *can* differ when zero-total cells are present,
+        and gpudge's sparse paths use CSR. That split affects scanpy
+        1.11.2–1.12.3 and the 1.13.0a1 prerelease; versions before 1.11.2
+        never had it. scverse/scanpy#4256 fixes it by adopting this same
+        positive-cell median on the CSR branch — merged upstream and
+        backported to the 1.12.x branch for 1.12.4, but in no release as of
+        1.12.3. The choice of
+        target is **not** neutral: in exact arithmetic it is a common scale, but
+        (a) with ``epsilon > 0`` arithmetic ``log2_fold_change`` is
+        target-dependent — generally negligible when both means greatly exceed
+        ``epsilon``, but material for zero or near-zero means, and absent at
+        ``epsilon=0``, (b) ``mean_calc="geometric"`` uses
+        ``expm1(mean(log1p(x)))``, which is not scale-homogeneous and so is
+        target-dependent regardless of ``epsilon``, and (c) row scales are
+        applied in float32 and equal values are treated as ties, so a different
+        target can create or destroy ties and move ``Ueffect``, ``p_value`` and
+        ``p_adj`` — the normalization-specific case of the float32 tie
+        behaviour under **Numerical precision** in Notes, which applies
+        whether or not normalization is on. Non-zero reported means are in
+        target-dependent units;
+        ``filter_gene_min_cpm_cell`` cancels the target mathematically but can
+        still flip at a float32 boundary. ``cpm_normalize=True`` is exactly
         ``normalize_target_sum=1e6``; **only one** of the two may be set (else
         ``ValueError``). Note the naming nuance: scanpy spells "use the median"
         as ``target_sum=None``, whereas here ``None`` means "off" and the median
@@ -316,7 +625,35 @@ def de(
         the dict values. Keys must be from the default output column set:
         ``target``, ``feature``, ``target_mean``, ``ref_mean``,
         ``target_ncells``, ``ref_ncells``, ``log2_fold_change``,
-        ``p_value``, ``test_statistic``, ``p_adj``.
+        ``p_value``, ``Ueffect``, ``p_adj``. When ``lfc_threshold`` is set,
+        directional ``tau=<±τ>_{p,Ueffect,padj}`` names are also valid
+        keys; when ``tau_star`` is set, so are the ``tau*_p<level>`` names;
+        when ``tau_star_se`` is set, so are ``tau*_lo_p0.025``,
+        ``tau*_hi_p0.025`` and ``tau*_se``.
+    stream_n_workers : int, default 16
+        Streaming only (``archive=``); ignored on the in-memory path. Meaning
+        depends on the archive's layout:
+
+        * ``layout='shard'`` — CPU decode-ahead workers for
+          ``iter_group_shards``. Peak host RAM scales with this (~14 GB per
+          worker on CCL_2); it is the speed-vs-host-RAM dial.
+        * ``layout='cell'`` — decode threads for shardad's Rust cell gather.
+          Costs no extra host RAM; 16 is the measured sweet spot.
+
+        Unused on the shard-layout GPU device-decode path, which requires
+        ``stream_prefetch=0``.
+    stream_prefetch : int, default 2
+        Streaming only (``archive=``). Decode-ahead queue depth on
+        ``layout='shard'`` (``0`` disables prefetch, the low-host-RAM
+        fallback). **No effect on ``layout='cell'``**, which gathers
+        synchronously.
+    release_gpu_memory : bool, default True
+        Return gpudge's GPU memory caches (torch's caching allocator and, if
+        importable, cupy's pools) to the CUDA driver on exit, so a same-process
+        caller can allocate GPU memory after de() (otherwise the pools hold ~all
+        of VRAM and the caller's next cudaMalloc / cuBLAS op can OOM). Pass
+        ``False`` to keep the caches resident (avoids re-allocating the resident
+        reference when calling de() repeatedly in a tight loop). ``gpudge_arc#76``.
 
     Returns
     -------
@@ -339,10 +676,32 @@ def de(
         sentinel).
     KeyError
         If ``output_columns`` contains a key not present in the default
-        output schema.
+        output schema or, when ``lfc_threshold`` is set, the directional
+        ``tau=<±τ>_{p,Ueffect,padj}`` schema.
 
     Notes
     -----
+    **Bring-your-own cell source.** ``cell_source`` yields ``CellGroup``:
+
+        CellGroup(label, X, rows=None)
+
+    ``label`` is the target's label (not an index -- gpudge maps it through
+    ``targets``, so yield order is free). ``rows=None`` means all rows of
+    ``X``; passing indices lets you yield one shared matrix per group without
+    copying, and they must be a 1-D integer array, in range, without
+    duplicates (a bool mask or float array is rejected rather than silently
+    cast to different cells); a *dense* ``X`` must additionally be
+    C-contiguous and aligned when ``rows`` re-orders or subsets it and library
+    sizes are being computed, since numpy reduces a Fortran-ordered, strided
+    or unaligned slice in a different order. There is deliberately no way to
+    supply library sizes: gpudge computes them with its own kernel, which is
+    what keeps CPM scaling byte-identical to every other gpudge path --
+    guaranteed for a target matrix that is CSR, or C-contiguous and aligned
+    dense, with standard NumPy/SciPy semantics (gpudge sums what it is handed,
+    so a group gathered out of a
+    Fortran-ordered parent will differ in the last bits from summing that
+    parent and indexing).
+
     **Filtering is opt-in.** By default (all ``filter_gene_*`` and
     ``keep_genes`` are ``None``) no gene is dropped before the Mann–Whitney
     U test. Pass one or more ``filter_gene_*`` thresholds or a ``keep_genes``
@@ -362,18 +721,75 @@ def de(
     may increase or decrease relative to an unfiltered run. This is expected
     behaviour, not a bug — it is **not** equivalent to formal
     independent-filtering (which guarantees non-inflation).
+
+    **Numerical precision: expression is staged in float32.** Every densify
+    path — the numba CSR kernel, the scipy fallback and the dense slice —
+    emits float32 regardless of ``adata.X``'s dtype, so a float64 input is
+    **downcast**, and float32 is what is held resident on the GPU. Reductions
+    are then accumulated in float64, so the quantization loss is entirely at
+    that staging step; it is invisible from the returned schema, in which
+    every statistic is ``Float64``. Two consequences, neither a correctness
+    bug in the statistics but both worth knowing before calibrating a
+    tolerance (``gpudge_arc#115``):
+
+    - ``log2_fold_change`` carries an **absolute** error floor on the order
+      of one float32 ulp, *independent of the fold change's magnitude* — a
+      float32-relative error in a group mean becomes an absolute error in
+      its log, ``d(log2 FC) = (1/ln 2) · (dm/m)``. Measured against a
+      construction whose true answer is zero to float64 round-off: max
+      ``9.8e-08``, median ``3.0e-08``, unbiased and uncorrelated with
+      ``|log2_fold_change|``. The same contrast on a float64 CPU backend
+      (scanpy) is ``3e-15``, so a tolerance calibrated there will not hold
+      here: two gpudge runs cannot be asserted equal below ~``1e-7``
+      absolute, at any fold change.
+    - ``Ueffect``, ``p_value`` and ``p_adj`` inherit float32 **tie**
+      behaviour, because the Mann–Whitney sort ranks the float32 tensor and
+      equal values are treated as ties. This channel is **not** bounded by
+      the argument above: quantization can create or destroy a tie, so a
+      gene can cross a significance threshold for purely numerical reasons.
+      A downstream top-K selection that filters on ``p_adj`` before ranking
+      is therefore not stable to float32 granularity, however large the
+      effect-size gaps are.
     """
-    # --- streaming vs in-memory dispatch (cheap, archive-free checks first) ---
-    _streaming = shard_archive is not None
-    if (adata is None) == (shard_archive is None):
-        raise ValueError(
-            "de(): provide exactly one of adata= or shard_archive= "
-            "(got both or neither)."
+    # --- archive= / shard_archive= alias, before anything reads either ---
+    if shard_archive is not None:
+        if archive is not None:
+            raise ValueError(
+                "de(): pass only archive=; shard_archive= is the deprecated "
+                "spelling of the same parameter (got both)."
+            )
+        warnings.warn(
+            "de(shard_archive=...) is deprecated; use de(archive=...). The new "
+            "spelling takes both shard-layout and cell-layout archives. The old "
+            "one will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-    if isinstance(reference, ad.AnnData) and not _streaming:
+        archive = shard_archive
+    # --- streaming vs in-memory dispatch (cheap, archive-free checks first) ---
+    _streaming = archive is not None
+    _byo = cell_source is not None
+    _modes_set = [name for name, on in (("adata=", adata is not None),
+                                        ("archive=", archive is not None),
+                                        ("cell_source=", _byo)) if on]
+    if len(_modes_set) != 1:
         raise ValueError(
-            "de(): an AnnData reference= is only supported with shard_archive= "
-            "(streaming mode); for in-memory de() pass a reference group label."
+            "de(): provide exactly one of adata= or archive= or cell_source= "
+            f"(got {', '.join(_modes_set) if _modes_set else 'none'})."
+        )
+    # EARLY, and deliberately so: de()'s ALL_OTHERS feature guards below fire
+    # on `isinstance(reference, str) and reference == ALL_OTHERS`, so without
+    # this a BYO caller passing ALL_OTHERS with tau_star=/lfc_threshold= would
+    # get "tau_star is not supported with ALL_OTHERS" -- true, but beside the
+    # point. Rejecting the reference TYPE here makes `reference` provably
+    # non-str in BYO mode, so those guards can never fire and neither is
+    # touched.
+    if _byo and (reference is None or isinstance(reference, str)):
+        raise ValueError(
+            "de(cell_source=...) requires reference= to be the control pool "
+            "itself -- an AnnData or a cells x genes matrix. A group label "
+            "(and the ALL_OTHERS sentinel) has no obs column to resolve "
+            f"against here; got {type(reference).__name__}."
         )
     # --- shared input validation (BOTH paths, before any GPU work or archive
     #     open) so the streaming and in-memory paths reject identical inputs. ---
@@ -386,7 +802,7 @@ def de(
         )
     # Accept the pre-v0.1 sentinel value with a deprecation warning. This MUST
     # run before the streaming dispatch so the ALL_OTHERS guard below also
-    # catches the legacy spelling (unsupported with shard_archive=); otherwise
+    # catches the legacy spelling (unsupported with archive=); otherwise
     # reference='all_others' would skip the warning + NotImplementedError and
     # fall through to a misleading "not among the reference labels" error — and,
     # worst case, a real group literally named 'all_others' would be used as a
@@ -408,6 +824,29 @@ def de(
         )
     if not math.isfinite(epsilon) or epsilon < 0:
         raise ValueError(f"epsilon must be a finite value >= 0, got {epsilon!r}.")
+    lfc_combos = normalize_lfc_spec(lfc_threshold, lfc_threshold_alt)
+    taustar_se = normalize_taustar_se(tau_star_se)
+    taustar_levels = normalize_taustar_spec(tau_star, taustar_se=taustar_se)
+    # Validated unconditionally: only USED when tau_star is set, but a nonsense
+    # value is a caller error either way. The docstring says "used only when",
+    # NOT "ignored" -- de(tau_star=None, tau_star_iters=0) does raise.
+    taustar_iters = normalize_taustar_iters(tau_star_iters)
+    if taustar_levels is not None and isinstance(reference, str) \
+            and reference == ALL_OTHERS:
+        # NotImplementedError, matching the lfc_threshold guard --
+        # NOT ValueError. The constraint is "same error shape as
+        # lfc_threshold", and that shape is NotImplementedError.
+        raise NotImplementedError(
+            f"tau_star is not supported with reference=ALL_OTHERS "
+            f"({ALL_OTHERS!r}). The one-vs-rest path ranks all cells jointly, "
+            f"so there is no per-reference distribution to shift.")
+    if lfc_combos is not None and isinstance(reference, str) \
+            and reference == ALL_OTHERS:
+        raise NotImplementedError(
+            f"lfc_threshold is not supported with reference=ALL_OTHERS "
+            f"({ALL_OTHERS!r}). The one-vs-rest path ranks all cells jointly, "
+            f"which has no per-reference distribution to shift by 2**tau. Use "
+            f"an explicit reference (a group name or a control AnnData).")
     if cpm_normalize and normalize_target_sum is not None:
         raise ValueError(
             "only one of cpm_normalize / normalize_target_sum may be set "
@@ -419,11 +858,15 @@ def de(
                 "output_columns must be a non-empty dict mapping default column "
                 "names to output names, or None (got an empty dict)."
             )
-        unknown = [k for k in output_columns if k not in DEFAULT_OUTPUT_COLUMNS]
+        allowed = tuple(DEFAULT_OUTPUT_COLUMNS) + tuple(
+            (lfc_column_names(lfc_combos) if lfc_combos else [])
+            + (taustar_column_names(taustar_levels, taustar_se)
+               if taustar_levels else []))
+        unknown = [k for k in output_columns if k not in allowed]
         if unknown:
             raise KeyError(
                 "output_columns keys not present in the de() output schema: "
-                f"{unknown}. Valid keys: {list(DEFAULT_OUTPUT_COLUMNS)}"
+                f"{unknown}. Valid keys: {list(allowed)}"
             )
         dests = list(output_columns.values())
         if len(set(dests)) != len(dests):
@@ -431,48 +874,207 @@ def de(
                 f"output_columns maps multiple keys to the same name: {dests}."
             )
 
+    def _finish(result):
+        # Return gpudge's GPU caches to the driver on a successful return (unless
+        # the caller opted out) so a same-process caller can allocate GPU memory
+        # after de(); torch/cupy pools otherwise hold ~all of VRAM. #76
+        if release_gpu_memory:
+            _release_gpu_memory()
+        return result
+
+    if _byo:
+        if not callable(cell_source):
+            raise TypeError(
+                "de(): cell_source must be a callable returning an iterable "
+                f"of CellGroup; got {type(cell_source).__name__}."
+            )
+        if targets is None or var_names is None:
+            raise ValueError(
+                "de(cell_source=...) requires targets= (the ordered target "
+                "labels) and var_names= (the gene axis)."
+            )
+        _targets = np.asarray(targets, dtype=str)
+        _var_names = np.asarray(var_names, dtype=str)
+        if _targets.ndim != 1 or _targets.size == 0:
+            raise ValueError(
+                "de(): targets must be a non-empty 1-D sequence of labels.")
+        if _var_names.ndim != 1 or _var_names.size == 0:
+            raise ValueError(
+                "de(): var_names must be a non-empty 1-D sequence of names.")
+        if np.unique(_targets).size != _targets.size:
+            raise ValueError(
+                "de(): targets contains duplicate labels; each target must "
+                "appear exactly once.")
+        if groupby is not None:
+            raise ValueError(
+                "de(): groupby= is not used with cell_source= -- the source "
+                "decides the grouping. Pass the labels via targets=.")
+        if isinstance(reference, ad.AnnData):
+            # Order, not just count: a permuted reference would otherwise
+            # return confidently wrong per-gene results. Matches the existing
+            # external-reference check for de(adata=, reference=<AnnData>).
+            if not np.array_equal(np.asarray(reference.var_names, dtype=str),
+                                  _var_names):
+                raise ValueError(
+                    "reference AnnData var_names do not match var_names "
+                    "(element-for-element, not just in length); align the "
+                    "reference to the gene axis you are passing.")
+            _ref_X = reference.X
+        else:
+            _ref_X = reference
+        # BEFORE the .shape reads below, and before the CUDA check, so a
+        # malformed reference fails fast on CPU with a clear message rather
+        # than as an AttributeError inside cell_source_de.
+        _check_2d(_ref_X, "reference")
+        if int(_ref_X.shape[0]) == 0:
+            raise ValueError(
+                "reference has 0 cells; an external reference pool must be "
+                "non-empty.")
+        if int(_ref_X.shape[1]) != int(_var_names.size):
+            raise ValueError(
+                f"reference has {int(_ref_X.shape[1])} genes but var_names has "
+                f"{int(_var_names.size)}; the reference and targets must share "
+                "the gene axis.")
+        if isinstance(normalize_target_sum, str) \
+                and normalize_target_sum == "median":
+            raise NotImplementedError(
+                "normalize_target_sum='median' is not supported with "
+                "cell_source= yet: the median needs a row-sums pre-pass over "
+                "every target group before DE can start. Pass the library-size "
+                "target as a number instead (e.g. normalize_target_sum=1e6, "
+                "or cpm_normalize=True).")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "gpudge requires a CUDA GPU; "
+                "torch.cuda.is_available() returned False"
+            )
+        from . import _refpool
+        return _finish(_refpool.cell_source_de(
+            cell_source, targets=_targets, var_names=_var_names,
+            reference=_ref_X, mean_calc=mean_calc, epsilon=epsilon,
+            gpu_gene_chunk_size=gpu_gene_chunk_size, oom_recovery=oom_recovery,
+            cpm_normalize=cpm_normalize,
+            normalize_target_sum=normalize_target_sum,
+            output_columns=output_columns, lfc_combos=lfc_combos,
+            taustar_levels=taustar_levels, taustar_iters=taustar_iters,
+            taustar_se=taustar_se,
+            filter_gene_min_mean_value=filter_gene_min_mean_value,
+            filter_gene_min_total_value=filter_gene_min_total_value,
+            filter_gene_min_cpm_cell=filter_gene_min_cpm_cell,
+            filter_gene_min_cpm_bulk=filter_gene_min_cpm_bulk,
+            keep_genes=keep_genes, device=torch.device("cuda"),
+        ))
+
     if _streaming:
+        for _name, _val in (("stream_n_workers", stream_n_workers),
+                            ("stream_prefetch", stream_prefetch)):
+            if not isinstance(_val, (int, np.integer)) or isinstance(_val, bool):
+                raise TypeError(
+                    f"{_name} must be an int, got {type(_val).__name__}."
+                )
+        if stream_n_workers < 1:
+            raise ValueError(
+                f"stream_n_workers must be >= 1, got {stream_n_workers}."
+            )
+        if stream_prefetch < 0:
+            raise ValueError(
+                f"stream_prefetch must be >= 0 (0 disables prefetch), got {stream_prefetch}."
+            )
         if densify_input:
             raise ValueError(
-                "de(): densify_input is not supported with shard_archive= "
+                "de(): densify_input is not supported with archive= "
                 "(X is never fully resident when streaming)."
             )
         if isinstance(reference, str) and reference == ALL_OTHERS:
             raise NotImplementedError(
                 f"de(): reference=ALL_OTHERS ({ALL_OTHERS!r}) is not supported with "
-                "shard_archive= (1-vs-rest needs global ranks over all cells)."
+                "archive= (1-vs-rest needs global ranks over all cells)."
             )
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "gpudge requires a CUDA GPU; torch.cuda.is_available() returned False"
             )
         from ._shard_stream import stream_de
-        return stream_de(
-            shard_archive,
+        return _finish(stream_de(
+            archive,
             groupby=groupby, reference=reference,
             mean_calc=mean_calc, epsilon=epsilon,
             gpu_gene_chunk_size=gpu_gene_chunk_size, oom_recovery=oom_recovery,
             cpm_normalize=cpm_normalize,
             normalize_target_sum=normalize_target_sum,
             output_columns=output_columns,
+            lfc_combos=lfc_combos,
+            taustar_levels=taustar_levels, taustar_iters=taustar_iters,
+            taustar_se=taustar_se,
+            filter_gene_min_mean_value=filter_gene_min_mean_value,
+            filter_gene_min_total_value=filter_gene_min_total_value,
+            filter_gene_min_cpm_cell=filter_gene_min_cpm_cell,
+            filter_gene_min_cpm_bulk=filter_gene_min_cpm_bulk,
+            keep_genes=keep_genes, stream_n_workers=stream_n_workers,
+            stream_prefetch=stream_prefetch, device=torch.device("cuda"),
+        ))
+    # ---- in-memory path below ----
+    if groupby is None or reference is None:
+        raise ValueError("de(): in-memory mode requires groupby= and reference=.")
+    # In-memory external reference pool: a separate control AnnData ranked
+    # resident-sorted on GPU with NO target-reference concat (the same core the
+    # streaming Mode-2 path runs -> results are bit-identical). Cheap invariants
+    # validated here, before the CUDA check, so they fail fast on CPU too.
+    if isinstance(reference, ad.AnnData):
+        if densify_input:
+            raise ValueError(
+                "de(): densify_input=True is not supported with an AnnData "
+                "reference= (the external reference is ranked resident on the "
+                "GPU, not densified in place; matches the streaming path)."
+            )
+        if reference.n_vars != adata.n_vars:
+            raise ValueError(
+                f"reference AnnData has {reference.n_vars} genes but adata has "
+                f"{adata.n_vars}; the reference and targets must share the gene "
+                "axis."
+            )
+        if not np.array_equal(np.asarray(reference.var_names),
+                              np.asarray(adata.var_names)):
+            raise ValueError(
+                "reference AnnData var_names do not match adata's gene axis "
+                "order; align the reference to adata.var_names."
+            )
+        if reference.n_obs == 0:
+            raise ValueError(
+                "reference AnnData has 0 cells; an external reference pool must "
+                "be non-empty."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "gpudge requires a CUDA GPU; "
+                "torch.cuda.is_available() returned False"
+            )
+        from ._refpool import inmem_external_ref_de
+        return _finish(inmem_external_ref_de(
+            adata, groupby=groupby, reference=reference,
+            mean_calc=mean_calc, epsilon=epsilon,
+            gpu_gene_chunk_size=gpu_gene_chunk_size, oom_recovery=oom_recovery,
+            cpm_normalize=cpm_normalize,
+            normalize_target_sum=normalize_target_sum,
+            output_columns=output_columns,
+            lfc_combos=lfc_combos,
+            taustar_levels=taustar_levels, taustar_iters=taustar_iters,
+            taustar_se=taustar_se,
             filter_gene_min_mean_value=filter_gene_min_mean_value,
             filter_gene_min_total_value=filter_gene_min_total_value,
             filter_gene_min_cpm_cell=filter_gene_min_cpm_cell,
             filter_gene_min_cpm_bulk=filter_gene_min_cpm_bulk,
             keep_genes=keep_genes, device=torch.device("cuda"),
-        )
-    # ---- in-memory path below ----
-    if groupby is None or reference is None:
-        raise ValueError("de(): in-memory mode requires groupby= and reference=.")
+        ))
     # Guard non-str reference BEFORE any `reference == ...` comparison: a
     # list/array reference would otherwise raise the opaque "truth value of an
     # array is ambiguous" error. ALL_OTHERS is itself a str, so isinstance
-    # covers the sentinel too. (reference=<AnnData> is only valid for streaming.)
+    # covers the sentinel too. (AnnData is handled above.)
     if not isinstance(reference, str):
         raise ValueError(
-            "de(): in-memory reference= must be a group-label string or the "
-            f"ALL_OTHERS sentinel (a string); got {type(reference).__name__}. "
-            "reference=<AnnData> is only valid with shard_archive=."
+            "de(): in-memory reference= must be a group-label string, the "
+            f"ALL_OTHERS sentinel (a string), or an AnnData control pool; got "
+            f"{type(reference).__name__}."
         )
     if reference == ALL_OTHERS and mean_calc == "geometric":
         raise NotImplementedError(
@@ -487,6 +1089,19 @@ def de(
             "torch.cuda.is_available() returned False"
         )
     device = torch.device("cuda")
+
+    # A non-CSR sparse adata.X (typically CSC from an upstream concat/cache)
+    # would silently drop to single-threaded scipy slicing in the numba fast
+    # paths (csr_row_sums / csr_rows_col_range_to_dense). Coerce once, in place,
+    # to canonical CSR (matches the densify_input in-place contract below); one
+    # UserWarning. Restricted to the literal-reference path: the ALL_OTHERS
+    # densify (all cells per chunk via adata.X[:, s:e].tocsc()) never touches the
+    # numba CSR kernel, so coercing CSC there buys nothing and would only add a
+    # per-chunk CSR->CSC round-trip — that path is a separately-scoped follow-up
+    # (#66). Leaving ALL_OTHERS untouched keeps it byte-for-byte as before.
+    if reference != ALL_OTHERS:
+        # stacklevel=3: de() -> ensure_csr -> warn points at the user's de() call.
+        adata.X = ensure_csr(adata.X, name="adata.X", stacklevel=3)
 
     from ._filter import (
         _row_scale_needs, validate_keep_genes, x_has_noncount_signal,
@@ -545,24 +1160,33 @@ def de(
     # (n_groups, ch) × float64. Count: arithmetic / U / p (= 3) for
     # mean_calc='arithmetic', plus a 4th (target_mean) for 'geometric'.
     # Fold that into bytes_per_gene so the heuristic doesn't blow past
-    # free GPU memory on datasets with many groups (e.g., cell line 2 with
+    # free GPU memory on datasets with many groups (e.g., CCL_2 with
     # 4672 target guides adds ~110-150K bytes/gene, comparable to the
     # ranking term for typical ref sizes).
+    n_combos = 0 if lfc_combos is None else len(lfc_combos)
+    # tau* accumulator ROWS, not levels: tau_star_se appends lo/hi/se. The
+    # sizer's `n_levels` parameter has always been a row count (it multiplies
+    # accumulator bytes); the name is kept because tests/test_stream.py passes
+    # it by keyword in 15 places.
+    n_taustar_rows = (0 if taustar_levels is None
+                      else len(taustar_column_names(taustar_levels, taustar_se)))
     if gpu_gene_chunk_size is None:
         free, _ = torch.cuda.mem_get_info(device)
+        max_group_rows = 0
         if state.ref_label == ALL_OTHERS:
             budget_n = state.n_cells
         else:
             counts = np.bincount(state.labels, minlength=n_groups)
             budget_n = int(counts[state.ref_label_idx])
+            if n_combos or n_taustar_rows:
+                max_group_rows = int(
+                    np.delete(counts, state.ref_label_idx).max(initial=0))
         gpu_gene_chunk_size = _auto_gene_chunk_size(
-            free_bytes=free,
-            budget_n=budget_n,
-            n_groups=n_groups,
-            mean_calc=mean_calc,
-            n_genes=state.n_genes,
+            free_bytes=free, budget_n=budget_n, n_groups=n_groups,
+            mean_calc=mean_calc, n_genes=state.n_genes,
             ref_mode=state.ref_label != ALL_OTHERS,
-        )
+            n_combos=n_combos, n_levels=n_taustar_rows,
+            max_group_rows=max_group_rows)
 
     n_genes = state.n_genes
     if state.ref_label == ALL_OTHERS:
@@ -578,6 +1202,12 @@ def de(
     keep_mask_acc = np.zeros((n_groups, n_genes), dtype=bool)
     U_acc = np.zeros((n_groups, n_genes), dtype=np.float64)
     p_acc = np.ones((n_groups, n_genes), dtype=np.float64)
+    dir_U_acc = (np.zeros((n_combos, n_groups, n_genes), dtype=np.float64)
+                 if n_combos else None)
+    dir_p_acc = (np.ones((n_combos, n_groups, n_genes), dtype=np.float64)
+                 if n_combos else None)
+    taustar_acc = (np.empty((n_taustar_rows, n_groups, n_genes), dtype=np.float64)
+                   if taustar_levels is not None else None)
 
     # Per-group mean in the OTHER unit (vs the X-units arith_*_acc), for the
     # filters whose unit the test path did not produce. Allocated lazily.
@@ -594,7 +1224,7 @@ def de(
 
     # Optionally drop the sparse matrix in favor of a dense one. Must rebind
     # adata.X (not just hold a local reference) so the sparse refcount goes
-    # to zero — keeping both representations alive at cell line 2 scale costs 310 GB
+    # to zero — keeping both representations alive at CCL_2 scale costs 310 GB
     # host and triggers severe paging.
     if densify_input and sp.issparse(adata.X):
         warnings.warn(
@@ -779,7 +1409,7 @@ def de(
     else:
         # ref-mode path: per gene chunk, densify ref ONCE then loop per group.
         # GPU memory per chunk = n_ref × chunk + m × chunk per group (not
-        # n_cells × chunk), which scales to cell line 2-size datasets.
+        # n_cells × chunk), which scales to CCL_2-size datasets.
         #
         # Both ref and per-group means are computed on GPU. Each slice is
         # already uploaded for the MWU sort/searchsorted, so the mean comes
@@ -789,11 +1419,11 @@ def de(
         # gets reused across all (chunk × group) iterations. torch's
         # implicit .to(device) on non-pinned memory does a CPU pin+copy
         # internally — nsys 2026-05-25 attributed ~12 s of cudaMemcpyAsync
-        # API wall to that step on cell line 2 (separate from the 11.7 s of
+        # API wall to that step on CCL_2 (separate from the 11.7 s of
         # actual H2D transfer). With the buffer pre-pinned, .to(device,
         # non_blocking=True) skips that step.
         #
-        # Sizing: max_group_rows × gpu_gene_chunk_size × 4 bytes. On cell line 2
+        # Sizing: max_group_rows × gpu_gene_chunk_size × 4 bytes. On CCL_2
         # that's ~7000 × ~6000 × 4 ≈ 170 MB. Pinned memory is reserved
         # for the whole de() call; freed when the function returns.
         #
@@ -814,10 +1444,15 @@ def de(
         # before reusing buf[k], synchronize() on event[k] waits for the
         # previous H2D queued from that buffer to complete.
         if HAS_NUMBA and sp.issparse(X_host) and X_host.format == "csr" and max_group_rows > 0:
+            # Cap the pinned buffer width at n_genes: a user-pinned
+            # gpu_gene_chunk_size above n_genes would over-allocate page-locked
+            # host memory (the gene-chunk loop below never emits a tile wider
+            # than n_genes). The loop step stays the raw gpu_gene_chunk_size. #80b
+            _pinned_w = _pinned_buf_width(gpu_gene_chunk_size, n_genes)
             group_host_bufs = [
-                torch.empty(max_group_rows, gpu_gene_chunk_size,
+                torch.empty(max_group_rows, _pinned_w,
                             dtype=torch.float32, pin_memory=True),
-                torch.empty(max_group_rows, gpu_gene_chunk_size,
+                torch.empty(max_group_rows, _pinned_w,
                             dtype=torch.float32, pin_memory=True),
             ]
             group_host_bufs_np = [b.numpy() for b in group_host_bufs]
@@ -903,6 +1538,16 @@ def de(
             # guarantees observed groups are non-empty, ref row is dropped.)
             p_chunk = torch.full(
                 (n_groups, ch), float("nan"), dtype=torch.float64, device=device)
+            if lfc_combos is not None:
+                dir_U_chunk = torch.zeros(
+                    (n_combos, n_groups, ch), dtype=torch.float64, device=device)
+                dir_p_chunk = torch.full(
+                    (n_combos, n_groups, ch), float("nan"),
+                    dtype=torch.float64, device=device)
+            if taustar_levels is not None:
+                taustar_chunk = torch.full(
+                    (n_taustar_rows, n_groups, ch), float("nan"),
+                    dtype=torch.float64, device=device)
             if mean_calc == "geometric":
                 target_mean_chunk = torch.zeros(
                     (n_groups, ch), dtype=torch.float64, device=device)
@@ -954,10 +1599,16 @@ def de(
                     del group_dense
                 _scales = (row_scales[group_rows_t[g]]
                            if row_scales is not None else None)
-                arith_t, reported_t, other_t, u1, p = group_chunk_stats(
+                (arith_t, reported_t, other_t, u1, p,
+                 dir_u1, dir_p, taustar_t) = group_chunk_stats(
                     group_t, sorted_ref, ref_tie_term, n_ref,
                     mean_calc=mean_calc, scale_main=_scale_main,
-                    group_scales=_scales, want_other=other_target_acc is not None)
+                    group_scales=_scales,
+                    want_other=other_target_acc is not None,
+                    lfc_combos=lfc_combos,
+                    taustar_levels=taustar_levels,
+                    taustar_iters=taustar_iters,
+                    taustar_se=taustar_se)
                 arith_target_chunk[g] = arith_t
                 if other_target_acc is not None:
                     other_target_chunk[g] = other_t
@@ -965,7 +1616,15 @@ def de(
                     target_mean_chunk[g] = reported_t
                 U_chunk[g] = u1
                 p_chunk[g] = p
-                del group_t, arith_t, reported_t, other_t, u1, p
+                if lfc_combos is not None:
+                    dir_U_chunk[:, g] = dir_u1
+                    dir_p_chunk[:, g] = dir_p
+                if taustar_levels is not None:
+                    taustar_chunk[:, g] = taustar_t
+                del (
+                    group_t, arith_t, reported_t, other_t, u1, p, dir_u1,
+                    dir_p, taustar_t,
+                )
 
                 iter_idx += 1
 
@@ -977,6 +1636,13 @@ def de(
                 del other_target_chunk
             U_acc[:, start:stop] = U_chunk.cpu().numpy()
             p_acc[:, start:stop] = p_chunk.cpu().numpy()
+            if lfc_combos is not None:
+                dir_U_acc[:, :, start:stop] = dir_U_chunk.cpu().numpy()
+                dir_p_acc[:, :, start:stop] = dir_p_chunk.cpu().numpy()
+                del dir_U_chunk, dir_p_chunk
+            if taustar_levels is not None:
+                taustar_acc[:, :, start:stop] = taustar_chunk.cpu().numpy()
+                del taustar_chunk
             if mean_calc == "geometric":
                 target_mean_acc[:, start:stop] = target_mean_chunk.cpu().numpy()
                 del target_mean_chunk
@@ -1038,6 +1704,19 @@ def de(
     flat_keep = keep_for_targets.ravel()
     # Pre-filter inside assemble_dataframe: build only the kept rows instead
     # of materialising n_target × n_features strings then dropping ~40 %.
+    extra_columns = None
+    if lfc_combos is not None:
+        extra_columns = {}
+        for k, (p_name, u_name, _q_name) in enumerate(lfc_base_names(lfc_combos)):
+            extra_columns[p_name] = dir_p_acc[k][target_indices]
+            extra_columns[u_name] = effect_size_from_u(
+                dir_U_acc[k][target_indices], target_ncells, ref_ncells)
+    if taustar_levels is not None:
+        extra_columns = extra_columns or {}
+        for k, name in enumerate(
+                taustar_column_names(taustar_levels, taustar_se)):
+            extra_columns[name] = taustar_acc[k][target_indices]
+
     df = assemble_dataframe(
         target=target_labels,
         feature=adata.var_names.to_numpy(),
@@ -1047,12 +1726,15 @@ def de(
         ref_ncells=ref_ncells,
         log2_fold_change=lfc,
         p_value=p_t2,
-        test_statistic=U_t2,
+        test_statistic=effect_size_from_u(
+            U_t2, target_ncells, ref_ncells),
         p_adj=np.zeros_like(p_t2),
         flat_keep=flat_keep,
+        extra_columns=extra_columns,
         output_columns=None,
     )
 
+    n_target = len(target_labels)
     if df.height > 0:
         # Per-row group index, derived directly from the 2D keep mask:
         # np.nonzero on a (n_target, n_features) bool returns (row, col)
@@ -1061,16 +1743,38 @@ def de(
         # `keep_indices = np.flatnonzero(flat_keep); post_filter_g =
         # keep_indices // n_features` formulation that held two large int64
         # arrays simultaneously.
-        n_target = len(target_labels)
         post_filter_g = np.nonzero(keep_for_targets)[0]
         g_idx = torch.from_numpy(post_filter_g)
-        p_torch = df["p_value"].to_torch()
-        adj = bh_per_group(p_torch, g_idx, n_target)
-        df = df.with_columns(p_adj=pl.Series(adj.numpy()))
+        adj = bh_per_group(df["p_value"].to_torch(), g_idx, n_target)
+        new_cols = [pl.Series("p_adj", adj.numpy())]
+        if lfc_combos is not None:
+            # Each (tau, direction) is its own family of hypotheses.
+            for p_name, _u_name, q_name in lfc_base_names(lfc_combos):
+                q = bh_per_group(df[p_name].to_torch(), g_idx, n_target)
+                new_cols.append(pl.Series(q_name, q.numpy()))
+        df = df.with_columns(new_cols)
+    elif lfc_combos is not None:
+        # ZERO ROWS still needs every directional p_adj to EXIST and be typed,
+        # or the schema differs from a populated result and from
+        # empty_output_frame.
+        df = df.with_columns([
+            pl.Series(q_name, [], dtype=pl.Float64)
+            for _p, _u, q_name in lfc_base_names(lfc_combos)
+        ])
+
+    # Final explicit projection pins the CANONICAL column order. Without it the
+    # p_adj columns land after ALL the p/Ueffect columns, giving
+    # p1,es1,p2,es2,q1,q2 instead of the required p1,es1,q1,p2,es2,q2.
+    if lfc_combos is not None or taustar_levels is not None:
+        df = df.select(
+            list(DEFAULT_OUTPUT_COLUMNS)
+            + (lfc_column_names(lfc_combos) if lfc_combos else [])
+            + (taustar_column_names(taustar_levels, taustar_se)
+               if taustar_levels else []))
 
     if output_columns is None:
-        return df
+        return _finish(df)
     # Keys + duplicate-destination validated at entry. select-THEN-rename (not
     # rename-then-select) so a destination name that shadows an unselected
     # default column can't collide on rename. (Codex review.)
-    return df.select(list(output_columns)).rename(output_columns)
+    return _finish(df.select(list(output_columns)).rename(output_columns))

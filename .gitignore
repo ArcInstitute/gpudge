@@ -12,3 +12,4 @@ uv.lock
 
 # slurm job logs from benchmarks/
 benchmarks/slurm-*.out
+
