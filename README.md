@@ -7,7 +7,8 @@ Arc VCI pipeline uses.
 
 ## Why
 
-- **Fast:** GPU Mann–Whitney in a single pass — on the CCL_1/500-perturbation DE stage, **~4,500× vs scanpy**, **~600× vs CPU pdex**, **~140× vs rapids-singlecell**; DE time stays near-constant as the perturbation count grows
+- **Fast:** the whole comparison in one GPU call, with the reference sorted once and
+  reused across perturbations — on the CCL_1/500-perturbation DE stage, **~4,500× vs scanpy**, **~600× vs CPU pdex**, **~140× vs rapids-singlecell**; DE time stays near-constant as the perturbation count grows
 - **Low host RAM**: can use shardad to stream AnnData shards without loading full matrix into RAM, enabling scaling to tens of millions of cells
 - **Opt-in per-gene filters** (`filter_gene_min_mean_value`,
   `filter_gene_min_cpm_cell`, etc.) — unit-named and AND-combinable;
@@ -111,7 +112,7 @@ dependencies**.
 ```bash
 # torch's CUDA 12.6 build is pulled from the PyTorch index:
 pip install --extra-index-url https://download.pytorch.org/whl/cu126 \
-  "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.7.0"
+  "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.8.0"
 ```
 
 Requires **Python ≥ 3.11**.
@@ -185,6 +186,12 @@ mamba activate gpudge
 a CUDA toolkit — only a host NVIDIA driver + GPU.)
 
 ## Usage
+
+> **New here?** [`docs/tutorial.md`](docs/tutorial.md) is a runnable quickstart on a
+> committed 5 MB slice of the public
+> [VCC 2025](https://huggingface.co/datasets/arcinstitute/VCC_train) screen — one `de()`
+> call, how to read the ten columns, and how to check the answer is right. Run it with
+> `python examples/quickstart.py`.
 
 ```python
 import anndata as ad

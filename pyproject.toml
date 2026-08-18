@@ -1,6 +1,6 @@
 [project]
 name = "gpudge"
-version = "0.7.0"
+version = "0.8.0"
 description = "Lightweight GPU-only Mann–Whitney U differential expression."
 readme = "README.md"
 authors = [{ name = "Arc Institute" }]

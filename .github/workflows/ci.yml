@@ -83,7 +83,7 @@ jobs:
         run: uv pip install -e ".[dev,fast]"
 
       - name: Lint (ruff)
-        run: uv run --no-sync ruff check src/ tests/
+        run: uv run --no-sync ruff check src/ tests/ examples/
 
       - name: Tests (pytest)
         run: uv run --no-sync pytest tests/

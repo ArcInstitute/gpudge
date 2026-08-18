@@ -72,6 +72,20 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
 ## How to extend
 
 - Always run the test suite (`pytest tests/`) — most tests run without a GPU.
+- **The quickstart is load-bearing documentation and is gated by an oracle.**
+  `docs/tutorial.md` + `examples/quickstart.py` run on a committed 5 MB subset of
+  the VCC 2025 screen (`docs/data/`, cut by `docs/make_tutorial_data.py`). At
+  600 x 1000 the whole result is recomputable with SciPy in ~1 s, so
+  `tests/test_tutorial.py` checks the tutorial's transcript — every row of the
+  top-hits table and all three figures in the on-target block — against an
+  **independent CPU MWU/BH oracle** rather than against `de()` itself. That runs
+  in CI with no GPU and catches a stale transcript AND a `de()` regression; the
+  two `needs_cuda` cases then pin `de()` to the same oracle. Not gated: the
+  ten-column table's prose, and the surrounding narrative.
+  ⚠️ Every p-value comparison passes `abs=0`. `pytest.approx(x, rel=r)` keeps a
+  **default absolute tolerance of 1e-12**, so without it any two sub-1e-12
+  p-values compare equal — three of these assertions were vacuous until a
+  mutation test (2.56e-31 -> 2.56e-25, suite stayed green) exposed it.
 - GPU-gated tests use the `needs_cuda` **`skipif`** decorator in
   `tests/conftest.py` — a `skipif`, not a registered marker, which is why
   `pytest -m needs_cuda` selects nothing and exits 5. Run the whole suite.
@@ -87,9 +101,9 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
   `pytest.importorskip("shardad")`) are not collected at all.
 
   Counts, measured 2026-08-18 — do not propagate them without re-measuring;
-  two upstream changes moved every figure here within one day. This tree with
-  **no** GPU reports **615 passed / 200 skipped** (815 collected), and its CI
-  reports **545 passed / 132 skipped** — 128 CUDA-gated cases, the 3
+  three upstream changes moved every figure here within two days. This tree with
+  **no** GPU reports **626 passed / 202 skipped** (828 collected), and its CI
+  reports **556 passed / 134 skipped** — 130 CUDA-gated cases, the 3
   module-level shardad skips, and the one real-data test. The three shardad
   suites hold **141 cases,
   70 of which need no GPU at all** (33 + 37 + 0 pass on a GPU-less host), so what
