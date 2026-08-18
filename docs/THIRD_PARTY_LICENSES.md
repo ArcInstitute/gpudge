@@ -50,7 +50,12 @@ licensed `MIT`** (see `LICENSE` and `pyproject.toml`).
 
 First build the environment. Resolve it from a clean checkout of the tagged tree,
 never from a developer `.venv` — this is the step whose absence made the previous
-audit ambiguous about which environment it described:
+audit ambiguous about which environment it described.
+
+**This recipe needs access to the private `ArcInstitute/shardad` repository**:
+`--extra streaming-gpu` resolves shardad over SSH, so the full 93-package audit
+is maintainer-only. Everything the core install pulls can be audited without it
+by dropping that extra.
 
 ```bash
 set -euo pipefail   # without errexit a failed mkdir/tar/cd falls through to
