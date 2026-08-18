@@ -29,6 +29,37 @@ class IngestedState:
     target_labels: np.ndarray   # str array, length n_targets
 
 
+
+# Stringified spellings of a missing value. pandas/numpy .astype(str) turns
+# NaN/None/pd.NA into exactly these, which is how an unassigned cell becomes a
+# LITERAL group label instead of an error. The in-memory path catches this at the
+# source (it still has the nullable column); the streaming backends only ever see
+# an already-stringified group table, so they screen the strings instead.
+# (ultrareview 2026-08)
+# Exactly the four strings pandas/numpy .astype(str) can produce for a missing
+# value. Deliberately NOT "NaN"/"NAN"/"" : those cannot arise from the conversion,
+# so rejecting them would refuse archives whose labels the in-memory ingest()
+# accepts -- breaking backend parity to guard against nothing. (codex review)
+MISSING_LABEL_SPELLINGS = frozenset({"nan", "None", "<NA>", "NaT"})
+
+
+def reject_missing_group_labels(labels, *, where: str, remedy: str) -> None:
+    """Raise if any label is the stringified form of a missing value.
+
+    ``labels`` is an iterable of already-stringified group labels. A group that is
+    genuinely *named* 'nan' is indistinguishable at this level and must be
+    renamed -- the message says so.
+    """
+    bad = sorted({lab for lab in labels if lab in MISSING_LABEL_SPELLINGS})
+    if bad:
+        raise ValueError(
+            f"{where}: group label(s) {bad} are the stringified form of a missing "
+            f"(NaN/None) value, so those cells were unassigned when the data was "
+            f"written. Treating them as a target group silently adds a bogus "
+            f"perturbation to the result. {remedy} If a group is genuinely named "
+            f"{bad[0]!r}, rename it."
+        )
+
 def ingest(adata: ad.AnnData, *, groupby: str, reference: str) -> IngestedState:
     if reference == LEGACY_ALL_OTHERS:
         warnings.warn(

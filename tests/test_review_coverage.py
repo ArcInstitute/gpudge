@@ -49,10 +49,23 @@ def test_cpm_normalize_matches_external(synth_small_sparse):
     # require correlation > 0.9999999 rather than bit-equality.
     p_pre = out_pre["p_value"].to_numpy()
     p_inl = out_inline["p_value"].to_numpy()
+    # Was `if finite.sum() > 10:`, which made the ONLY p-value assertion in the
+    # test vanish under exactly the regressions it exists to catch (all-NaN p,
+    # all-inf p, ten finite anti-correlated values, a 0-row frame all PASSED).
+    # `> 10` is also far too weak on its own -- it would still admit 239 of 250
+    # going NaN -- so assert the full expected row count and the full finite
+    # mask instead.
     finite = np.isfinite(p_pre) & np.isfinite(p_inl)
-    if finite.sum() > 10:
-        corr = np.corrcoef(p_pre[finite], p_inl[finite])[0, 1]
-        assert corr > 0.99999, f"cpm_normalize p-value correlation {corr:.6f}"
+    n_expected = ((synth_small_sparse.obs["comparison"].nunique() - 1)
+                  * synth_small_sparse.n_vars)          # targets x genes
+    assert len(p_pre) == len(p_inl) == n_expected, (len(p_pre), len(p_inl))
+    assert finite.all(), f"{(~finite).sum()} non-finite p-value pairs"
+    corr = np.corrcoef(p_pre[finite], p_inl[finite])[0, 1]
+    assert corr > 0.99999, f"cpm_normalize p-value correlation {corr:.6f}"
+    # Correlation ALONE is blind to any affine error -- a uniform p/2 gives
+    # r = 1.0 -- so bound the values too. Measured bit-exact (maxabs 0.0) on an
+    # H100; rtol=1e-9 leaves ~7 orders over a float64 ULP for another GPU.
+    np.testing.assert_allclose(p_inl, p_pre, rtol=1e-9, atol=1e-12)
 
 
 @needs_cuda
@@ -387,9 +400,26 @@ def test_zero_denominator_cpm_bulk_all_others_empty_rest():
     a = ad.AnnData(X=sp.csr_matrix(X), obs=obs,
                    var={"gene_id": [f"g{i}" for i in range(6)]})
     from gpudge import ALL_OTHERS
-    out = de(a, groupby="comparison", reference=ALL_OTHERS,
-             filter_gene_min_cpm_bulk=-1.0)          # keep-all; rest is empty
-    assert out is not None   # no crash / no inf in the bulk denominator
+    # `assert out is not None` was the whole test: de() has no `return None` on
+    # any path, so it could not fail -- deleting BOTH zero-libtot guards left it
+    # green. What the guards actually prevent is observable here as the absence
+    # of a 0/0 RuntimeWarning; the keep mask itself cannot see them, because it
+    # ORs the reference term with a target term that passes at every threshold
+    # (bulk_t >= 0 always, and a guarded bulk_r is 0, and `_one_filter_mask`
+    # compares with a strict `>`, under which 0 and NaN behave identically for
+    # every threshold >= 0 while a threshold < 0 short-circuits to all-True).
+    # So no value-level pin is possible, here or anywhere; the CPU-runnable
+    # half of this warning-level pin is
+    # test_filter.py::test_all_others_bulk_keep_survives_empty_rest.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        out = de(a, groupby="comparison", reference=ALL_OTHERS,
+                 filter_gene_min_cpm_bulk=-1.0)      # keep-all; rest is empty
+    assert out.height == 6
+    assert int(out["ref_ncells"][0]) == 0
+    for col in ("target_mean", "ref_mean", "log2_fold_change", "p_adj"):
+        assert np.all(np.isfinite(out[col].to_numpy())), col
 
 
 @needs_cuda
@@ -476,3 +506,34 @@ def test_refpool_de_core_signature_is_stable():
     assert len(params) == 24
     assert [(p.name, p.default) for p in params] == expected
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params)
+
+
+# --- 2026-08 ultrareview (lows) ---------------------------------------------
+
+@needs_cuda
+@pytest.mark.parametrize("kw", [
+    {"cpm_normalize": True},
+    {"normalize_target_sum": 1e6},
+    {"normalize_target_sum": "median"},
+    {"cpm_normalize": True, "filter_gene_min_cpm_cell": 1.0},
+])
+def test_normalization_does_not_mutate_adata_x(synth_small_sparse, kw):
+    """de() documents in four places that cpm_normalize / normalize_target_sum
+    do NOT touch the caller's X -- unlike densify_input and the CSC->CSR
+    coercion, which say the opposite and each have an explicit assertion. This
+    contract had none, and the one variant with no indirect detector anywhere
+    is exactly this one: every other normalization test passes `a.copy()` per
+    call, and the external-ref / cell_source / streaming byte-identity gates
+    only catch it because they happen to reuse one AnnData across two calls."""
+    a = synth_small_sparse.copy()
+    before = a.X.copy()
+    de(a, groupby="comparison", reference="ntc", **kw)
+    assert a.X.format == before.format
+    assert a.X.dtype == before.dtype        # assert_array_equal ignores dtype
+    assert a.X.shape == before.shape
+    np.testing.assert_array_equal(a.X.indptr, before.indptr)
+    np.testing.assert_array_equal(a.X.indices, before.indices)
+    # assert_array_equal, not allclose: the contract is "untouched", and an
+    # idempotent re-normalization moves log2FC by only ~4e-8, so a tolerant
+    # comparison would not see the residue this exists to catch.
+    np.testing.assert_array_equal(a.X.data, before.data)

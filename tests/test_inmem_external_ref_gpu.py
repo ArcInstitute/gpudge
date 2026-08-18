@@ -21,6 +21,17 @@ from conftest import _make_synth, needs_cuda   # bare import — CI gotcha
 shardad = pytest.importorskip("shardad", reason="requires gpudge[streaming]")
 from polars.testing import assert_frame_equal   # noqa: E402
 
+# check_exact=True is NOT optional in this file. polars' assert_frame_equal
+# defaults to check_exact=False with rel_tol=1e-5 / abs_tol=1e-8, which silently
+# turned this module's "bit-identity merge gate" (see the docstring above) into a
+# tolerance check — a 1-float32-ULP relative drift passed green at every
+# magnitude. Third occurrence of this trap in the repo (#110 was the first).
+# check_dtypes / check_row_order / check_column_order already default True; they
+# are named here so the intent survives a future polars default change.
+# (ultrareview 2026-08)
+EXACT = dict(check_exact=True, check_column_order=True,
+             check_row_order=True, check_dtypes=True)
+
 
 def _build(tmp_path, *, seed):
     """A guides-only archive (targets) + a separate NTC reference AnnData +
@@ -64,7 +75,7 @@ def test_inmem_external_ref_bit_identical_to_streaming(tmp_path, kw):
     df_stream = gpudge.de(shard_archive=d, reference=ref, **kw)
     df_inmem = gpudge.de(inmem, groupby="comparison", reference=ref, **kw)
     keys = ["target", "feature"]
-    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys))
+    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys), **EXACT)
 
 
 @needs_cuda
@@ -76,7 +87,7 @@ def test_inmem_external_ref_keep_genes_bit_identical(tmp_path):
     df_stream = gpudge.de(shard_archive=d, reference=ref, keep_genes=keep)
     df_inmem = gpudge.de(inmem, groupby="comparison", reference=ref,
                          keep_genes=keep)
-    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys))
+    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys), **EXACT)
 
 
 @needs_cuda
@@ -94,7 +105,7 @@ def test_inmem_external_ref_bit_identical_small_chunk(tmp_path, kw):
                           gpu_gene_chunk_size=12, **kw)
     df_inmem = gpudge.de(inmem, groupby="comparison", reference=ref,
                          gpu_gene_chunk_size=12, **kw)
-    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys))
+    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys), **EXACT)
 
 
 @needs_cuda
@@ -105,7 +116,7 @@ def test_inmem_external_ref_output_columns_bit_identical(tmp_path):
     df_stream = gpudge.de(shard_archive=d, reference=ref, output_columns=oc)
     df_inmem = gpudge.de(inmem, groupby="comparison", reference=ref,
                          output_columns=oc)
-    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys))
+    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys), **EXACT)
 
 
 @needs_cuda
@@ -119,7 +130,7 @@ def test_inmem_external_ref_csc_ref_bit_identical_to_streaming(tmp_path):
     keys = ["target", "feature"]
     df_stream = gpudge.de(shard_archive=d, reference=ref_csc)
     df_inmem = gpudge.de(inmem, groupby="comparison", reference=ref_csc)
-    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys))
+    assert_frame_equal(df_stream.sort(keys), df_inmem.sort(keys), **EXACT)
 
 
 @needs_cuda
@@ -140,7 +151,7 @@ def test_inmem_external_ref_csc_matches_csr(tmp_path):
     coerce = [w for w in rec if "converting to CSR" in str(w.message)]
     assert len(coerce) == 2                        # adata.X + reference.X
     keys = ["target", "feature"]
-    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys))
+    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys), **EXACT)
     assert inmem_csc.X.format == "csc"             # NON-mutating
     assert ref_csc.X.format == "csc"
 
@@ -202,7 +213,7 @@ def test_inmem_external_ref_large_pinned_chunk_bit_identical(tmp_path):
     df_auto = gpudge.de(inmem, groupby="comparison", reference=ref)
     df_big = gpudge.de(inmem, groupby="comparison", reference=ref,
                        gpu_gene_chunk_size=100_000)
-    assert_frame_equal(df_auto.sort(keys), df_big.sort(keys))
+    assert_frame_equal(df_auto.sort(keys), df_big.sort(keys), **EXACT)
 
 
 @needs_cuda
@@ -216,4 +227,4 @@ def test_mode1_literal_ref_large_pinned_chunk_bit_identical():
     df_auto = gpudge.de(adata, groupby="comparison", reference="ntc")
     df_big = gpudge.de(adata, groupby="comparison", reference="ntc",
                        gpu_gene_chunk_size=100_000)
-    assert_frame_equal(df_auto.sort(keys), df_big.sort(keys))
+    assert_frame_equal(df_auto.sort(keys), df_big.sort(keys), **EXACT)

@@ -70,16 +70,41 @@ def validate_keep_genes(keep_genes, n_genes: int) -> np.ndarray:
 def x_has_noncount_signal(X, *, k: int = 100_000, tol: float = 1e-6) -> bool:
     """True if a sample of X is fractional or negative (a non-raw-count signal).
 
-    Sparse: samples ``X.data`` (the nonzero values). Dense: samples
-    ``np.ravel(X)`` (NOT ``np.ndarray.data`` — that is a raw memory buffer, not
-    the values). Sampling uses ``np.linspace(0, n-1, k)`` indices so the span
+    Sparse: samples ``X.data`` (the nonzero values). Dense: samples flat
+    positions (NOT ``np.ndarray.data`` — that is a raw memory buffer, not the
+    values). Sampling uses ``np.linspace(0, n-1, k)`` indices so the span
     ALWAYS includes the first and last element (a head prefix could miss late
     fractional/negative values).
+
+    NEVER materialises a copy of the dense input. ``np.ravel`` defaults to
+    ``order='C'`` and therefore COPIES anything that is not already C-contiguous
+    — a whole-matrix transient (~40 GB for a 500k x 20k f32 group) inside a
+    function whose entire job is to read at most ``k`` values. ``order='K'``
+    returns a view for C- and F-contiguous input; genuinely strided input is
+    sampled through ``unravel_index`` with no flattening at all. Note
+    ``_check_sliceable_layout`` deliberately declines to normalise F-ordered
+    input, so non-C-contiguous dense really does reach here. The sample values
+    are unchanged for C-contiguous input; for other layouts the sampled
+    POSITIONS differ (K/strided order vs imposed row-major), which cannot change
+    the boolean result's meaning — it is a fractional/negative signal over a
+    spread-out sample either way. (ultrareview 2026-08)
     """
     if sp.issparse(X):
         data = X.data
     else:
-        data = np.ravel(np.asarray(X))
+        Xa = np.asarray(X)
+        n_elem = Xa.size
+        if n_elem == 0:
+            return False
+        if Xa.flags["C_CONTIGUOUS"] or Xa.flags["F_CONTIGUOUS"]:
+            data = np.ravel(Xa, order="K")          # view, never a copy
+        else:
+            idx = np.linspace(0, n_elem - 1, min(k, n_elem), dtype=np.int64)
+            rc = np.unravel_index(idx, Xa.shape)
+            sample = Xa[rc]
+            if (sample < 0).any():
+                return True
+            return bool(np.any(np.abs(sample - np.rint(sample)) > tol))
     n = data.shape[0]
     if n == 0:
         return False

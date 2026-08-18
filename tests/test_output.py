@@ -1,4 +1,6 @@
 # tests/test_output.py
+import warnings
+
 import numpy as np
 import polars as pl
 import pytest
@@ -277,3 +279,101 @@ def test_fully_filtered_result_keeps_the_populated_schema():
     assert none.height == 0
     assert none.schema == full.schema
     assert none.schema == empty_output_frame(extra_names=list(extra)).schema
+
+
+# --- 2026-08 ultrareview (lows): log2_ratio's CONDITIONAL warning suppression
+
+def test_log2_ratio_is_silent_on_the_documented_epsilon_zero_cases():
+    """epsilon=0 promises NaN for a both-zero gene and ±inf for a one-sided
+    one. A documented outcome must not also emit a RuntimeWarning, nor raise
+    under `-W error::RuntimeWarning`."""
+    from gpudge._output import log2_ratio
+    tm = np.array([[0.0, 3.0, 0.0, 2.0]])
+    rm = np.array([0.0, 0.0, 3.0, 1.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        got = log2_ratio(tm, rm, 0.0)
+    assert np.isnan(got[0, 0])
+    assert got[0, 1] == np.inf
+    assert got[0, 2] == -np.inf
+    assert np.isfinite(got[0, 3])
+
+
+@pytest.mark.parametrize("tm,rm", [
+    # Each pairs an UNDEFINED input with a 0/0 in the same array. The 0/0 is
+    # what the NaN row needs -- a NaN propagates silently, so a bare NaN mean
+    # warns about nothing. The two negative rows would warn from log2 on their
+    # own; the pairing just makes all three cases uniform. What is pinned in
+    # every case is that the suppression is OFF.
+    ([[-1.0, 0.0]], [1.0, 0.0]),         # negative TARGET mean
+    ([[1.0, 0.0]], [-1.0, 0.0]),         # negative REFERENCE mean
+    ([[np.nan, 0.0]], [1.0, 0.0]),       # NaN mean
+])
+def test_log2_ratio_keeps_warning_on_undefined_input(tm, rm):
+    """The suppression is conditional and must stay that way. gpudge accepts
+    arbitrary X, so a centered / log-transformed input can carry a negative
+    mean; log2 of a negative ratio is UNDEFINED, not documented, and blanket
+    errstate would hide it (codex review)."""
+    from gpudge._output import log2_ratio
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        log2_ratio(np.array(tm), np.array(rm), 0.0)
+    assert any(issubclass(w.category, RuntimeWarning) for w in caught), \
+        [str(w.message) for w in caught]
+
+
+@pytest.mark.parametrize("tm_shape,ref_shape,want", [
+    ((0, 4), (4,), (0, 4)),     # empty TARGET axis, ref populated
+    ((3, 0), (0,), (3, 0)),     # both empty
+    ((3, 1), (0,), (3, 0)),     # rm.size == 0 ALONE -- broadcasts to (3, 0)
+])
+def test_log2_ratio_handles_empty_inputs(tm_shape, ref_shape, want):
+    """`.min()` on an empty array raises ValueError, so the size guard is load
+    bearing. epsilon=0.0 is REQUIRED here: with a positive epsilon the gate
+    short-circuits before the guard is reached and the test cannot fail
+    (codex review). A zero-GENE adata reaches this helper with an empty axis."""
+    from gpudge._output import log2_ratio
+    got = log2_ratio(np.zeros(tm_shape), np.zeros(ref_shape), 0.0)
+    assert got.shape == want
+
+
+@pytest.mark.parametrize("tm,rm", [
+    ([[np.inf, 0.0]], [np.inf, 0.0]),    # inf/inf -> NaN, undefined not documented
+    ([[1.0, 0.0]], [np.inf, 0.0]),       # infinite REFERENCE mean
+])
+def test_log2_ratio_keeps_warning_on_infinite_means(tm, rm):
+    """`inf >= 0` is True, so a bare non-negativity test suppressed `inf/inf`
+    — which is undefined, not one of the documented epsilon=0 outcomes
+    (codex review)."""
+    from gpudge._output import log2_ratio
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        log2_ratio(np.array(tm), np.array(rm), 0.0)
+    assert any(issubclass(w.category, RuntimeWarning) for w in caught), \
+        [str(w.message) for w in caught]
+
+
+def test_log2_ratio_keeps_warning_when_epsilon_is_positive():
+    """The `epsilon == 0` gate is BEHAVIOURAL, not only a scan-skip.
+
+    My first reading was that a positive epsilon makes the denominator
+    `>= epsilon`, so divide/invalid cannot fire — wrong: it is the QUOTIENT
+    that can reach zero. Here every input is finite and non-negative and
+    epsilon > 0, yet `1e-300 / 3.4e38` underflows to 0.0 and `log2(0)` emits
+    "divide by zero encountered in log2". Without the epsilon gate that is
+    suppressed. (codex review, round 3.)"""
+    from gpudge._output import log2_ratio
+    tm = np.array([[0.0]])
+    ref = np.array([float(np.finfo(np.float32).max)])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # under="ignore" pinned: with under="warn" the divide's own underflow
+        # warning would satisfy a bare any(RuntimeWarning) and the test would
+        # stay green with the log2 warning suppressed (codex review).
+        with np.errstate(under="ignore"):
+            got = log2_ratio(tm, ref, 1e-300)
+    assert got.ravel()[0] == -np.inf
+    messages = [str(w.message) for w in caught
+                if issubclass(w.category, RuntimeWarning)]
+    assert any("divide by zero encountered in log2" in m
+               for m in messages), messages

@@ -1,15 +1,14 @@
 # Conda / mamba environment for gpudge.
 #
-# gpudge has no conda package (it's a private repo; conda-forge is for public
-# packages). So conda/mamba just provides Python + pip, and pip installs gpudge
+# gpudge has no conda-forge package. So conda/mamba just provides Python + pip, and pip installs gpudge
 # (and the CUDA 12.6 torch build) from the git tag.
 #
 #   mamba env create -f environment.yml   # or: conda env create -f environment.yml
 #   mamba activate gpudge
 #
-# Requires GitHub SSH access to ArcInstitute. The host needs an NVIDIA driver +
-# an H100/A100/Hopper GPU; torch's CUDA libraries ship inside the pip wheel, so
-# no conda CUDA toolkit is needed.
+# The host needs an NVIDIA driver and a CUDA GPU with enough VRAM for the
+# reference pool; torch's CUDA libraries ship inside the pip wheel, so no
+# conda CUDA toolkit is needed.
 #
 # For the optional `de(archive=...)` streaming path, also install shardad
 # (private, shardad[cell]>=0.7.1) and switch the extra to [fast,streaming]:
@@ -27,4 +26,4 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126
-      - "gpudge[fast] @ git+ssh://git@github.com/ArcInstitute/gpudge.git@v0.7.0"
+      - "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.7.0"

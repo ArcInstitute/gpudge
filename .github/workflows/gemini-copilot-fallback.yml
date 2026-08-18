@@ -53,7 +53,13 @@ jobs:
     runs-on: ubuntu-latest
     # Skip drafts (Gemini doesn't auto-review until ready_for_review fires)
     # and skip events triggered by either review bot (defensive; loop-safe).
+    # The head-repo test skips FORK PRs: their GITHUB_TOKEN is read-only, so
+    # every comment below would 403, and the fallback message it posts tells the
+    # author to run `gh pr edit --add-reviewer`, which an external contributor
+    # has no permission to do. Nudging this repo's own reviewers is a
+    # maintainer-side concern; a fork PR has nothing to nudge.
     if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft == false &&
       github.actor != 'gemini-code-assist[bot]' &&
       github.actor != 'copilot-pull-request-reviewer[bot]'

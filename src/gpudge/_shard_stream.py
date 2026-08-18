@@ -11,14 +11,17 @@ import numpy as np
 import torch
 
 from ._csr_dense import csr_row_sums, csr_rows_col_range_to_dense, ensure_csr
+from ._gpu_mem import _release_gpu_memory
 from ._filter import validate_keep_genes
+from ._ingest import reject_missing_group_labels
 from ._lfc import lfc_column_names
 from ._mwu import (
-    _tie_term_per_gene, mwu_one_group, mwu_one_group_lfc,
+    _tie_term_per_gene, mwu_one_group, mwu_one_group_lfc, tie_acc_dtype,
     mwu_one_group_taustar,
 )
 from ._output import DEFAULT_OUTPUT_COLUMNS
 from ._stream import run_gene_chunks_with_recovery
+from ._stream_backend import validate_archive_reference
 from ._taustar import taustar_column_names
 
 logger = logging.getLogger(__name__)
@@ -241,22 +244,30 @@ class _ShardBackend:
                 f"without unassigned reference cells. (mirrors the _ingest guard)"
             )
         ref_label_set = set(np.asarray(ref_col).astype(str).tolist())
-        if reference is not None and str(reference) not in ref_label_set:
-            raise ValueError(
-                f"reference={reference!r} is not among the archive's reference "
-                f"labels {sorted(ref_label_set)}."
-            )
-        msg_label = (str(reference) if reference is not None
-                     else "|".join(sorted(ref_label_set)))
+        msg_label = validate_archive_reference(reference, ref_label_set)
         return ref_adata.X, msg_label
 
     def targets(self):
         if self._tgt_index is None:
             (self._targets, self._tgt_index,
              self._max_group_rows) = _enumerate_targets(self._arch)
+            # _enumerate_targets guards the REFERENCE shard's obs for missing
+            # labels but not the target side, which arrives already stringified
+            # from the shard manifests -- so an unassigned cell becomes a target
+            # group literally named 'nan'. Same policy as _ingest and the cell
+            # backend. (ultrareview 2026-08)
+            reject_missing_group_labels(
+                (str(t) for t in self._targets),
+                where=f"{getattr(self._arch, 'path', 'archive')} (target groups)",
+                remedy=("Drop or assign the unassigned cells before writing "
+                        "the archive."))
         return list(self._targets), self._max_group_rows
 
     def target_row_sums(self):
+        # Enumerate (and therefore VALIDATE) the target labels before decoding
+        # anything: median normalisation would otherwise read every shard and
+        # only then reject the archive for an unassigned-cell label. (codex review)
+        self.targets()
         sums = []
         for gs in self._iter():
             if self.supports_device_decode:
@@ -305,6 +316,21 @@ def _reference_prepass(ref_X, n_genes, device, chunk, *, mean_calc,
     n_ref = int(ref_X.shape[0])
 
     # Oversized guard: the resident sorted reference is dense n_ref×n_genes f32.
+    #
+    # Trim the caching allocators BEFORE reading free VRAM. This is a HARD guard:
+    # a false negative does not cost a suboptimal chunk, it REFUSES the run with
+    # "use a larger-memory GPU" for a reference that fits perfectly well. Without
+    # the trim the comparison is against driver-free bytes while torch (and cupy)
+    # may still be sitting on cached-but-unused blocks from a previous de() in the
+    # same process -- reproduced with the docstring's own release_gpu_memory=False
+    # loop, where call 2 of a byte-identical previously-successful call died here
+    # and one empty_cache() made it succeed with a bit-identical result.
+    #
+    # DELIBERATELY NOT extended to the two soft SIZER read sites: deferring the
+    # reclaim there is a documented decision in the #76 design (a pinned
+    # gpu_gene_chunk_size is an intentional opt-out of the trim), and their
+    # failure mode is a downshift, not a refusal. (ultrareview 2026-08)
+    _release_gpu_memory(run_gc=True)
     projected = n_ref * n_genes * 4
     free = _free_gpu_bytes(device)
     if projected >= free:
@@ -325,7 +351,13 @@ def _reference_prepass(ref_X, n_genes, device, chunk, *, mean_calc,
     ref_libtot = float(ref_row_sums.sum()) if ref_row_sums is not None else None
 
     sorted_ref_full = torch.empty((n_genes, n_ref), dtype=torch.float32, device=device)
-    ref_tie_term_full = torch.empty(n_genes, dtype=torch.float64, device=device)
+    # Dtype must MATCH _tie_term_per_gene's: it returns int64 in the exact regime,
+    # and the pooled tie term is only exact if the reference term stays integral
+    # all the way to _pool_tie. tie_acc_dtype is the single source of truth for
+    # that rule, so the two cannot drift -- and unlike a throwaway probe call it
+    # costs nothing and cannot emit a spurious fallback warning.
+    ref_tie_term_full = torch.empty(n_genes, dtype=tie_acc_dtype(n_ref),
+                                    device=device)
     arith_ref = np.zeros(n_genes, dtype=np.float64)
     ref_mean = np.zeros(n_genes, dtype=np.float64)
     other_ref = np.zeros(n_genes, dtype=np.float64) if need_other_unit else None

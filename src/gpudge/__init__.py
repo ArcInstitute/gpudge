@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 import os
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -22,6 +23,7 @@ from ._csr_dense import (
 from ._gpu_mem import _release_gpu_memory
 from ._ingest import ALL_OTHERS, LEGACY_ALL_OTHERS as _LEGACY_ALL_OTHERS, ingest
 from ._lfc import lfc_base_names, lfc_column_names, normalize_lfc_spec
+from ._normalize import normalize_cpm_flag
 from ._means import group_means
 from ._mwu import _rank_with_ties, _tie_term_per_gene
 from ._fdr import bh_per_group
@@ -29,6 +31,7 @@ from ._output import (
     DEFAULT_OUTPUT_COLUMNS,
     assemble_dataframe,
     effect_size_from_u,
+    log2_ratio,
 )
 from ._stream import (
     _auto_gene_chunk_size,
@@ -54,9 +57,9 @@ except PackageNotFoundError:
 if not HAS_NUMBA:
     warnings.warn(
         "gpudge: numba is not installed; falling back to scipy "
-        "for sparse CSR row slicing (~3x slower on CCL_2-scale inputs). "
-        "Install with `pip install gpudge[fast]` (or "
-        "`uv sync --extra fast`) to enable the numba kernel.",
+        "for sparse CSR row slicing (~3x slower on multi-million-cell "
+        "inputs). Install with `pip install gpudge[fast]` (or "
+        "`uv pip install -e \".[fast]\"`) to enable the numba kernel.",
         stacklevel=2,
     )
 
@@ -256,7 +259,8 @@ def de(
         label and ``ALL_OTHERS`` are both rejected, since there is no obs
         column to resolve them against. An AnnData reference must have
         ``var_names`` equal to ``var_names`` element-for-element. ``groupby``
-        is unused: the source decides the grouping.
+        must be omitted -- passing it raises, since the source decides the
+        grouping.
 
         **May be called more than once**, and must yield the same groups each
         time. Nothing calls it twice today, but the contract reserves it so
@@ -282,8 +286,11 @@ def de(
     var_names : Sequence[str]
         The gene axis, shared by every yielded group and by ``reference``. The
         gene count is ``len(var_names)``. Used only with ``cell_source``.
-    groupby : str
+    groupby : str | None
         Column in ``adata.obs`` that defines the groups (e.g. guide identity).
+        Required with ``adata``; resolved from the manifest with ``archive``;
+        must be omitted with ``cell_source`` (passing it raises), which carries
+        its group labels on the yielded ``CellGroup``s instead.
     reference : str | anndata.AnnData | numpy.ndarray | scipy.sparse matrix | None
         Name of the reference group in ``adata.obs[groupby]``, OR the
         ``ALL_OTHERS`` sentinel (``"__all_others__"``) for 1-vs-rest
@@ -299,6 +306,11 @@ def de(
         must equal ``adata`` / the archive gene axis in order. (Streaming only:
         if the archive also designates its own archive reference pool, the external
         pool wins and the archive reference pool is ignored with a ``UserWarning``.)
+        (Streaming only: an archive's OWN reference pool is read WHOLE. A
+        ``reference=`` naming it is validated for membership and does NOT
+        subset it, so on a multi-label pool ``reference='ntc'`` still ranks
+        against every reference row. A sequence naming the labels is accepted
+        too. Pass an external ``reference=<AnnData>`` for a genuine subset.)
         With ``cell_source=`` the pool may also be a bare cells x genes matrix,
         and a group name / ``ALL_OTHERS`` is rejected — there is no ``obs``
         column to resolve them against.
@@ -559,7 +571,24 @@ def de(
         False, the first OOM raises; an explicit ``gpu_gene_chunk_size`` is then
         honored exactly (use False for benchmarking, where a labeled chunk must
         be that chunk or an error). Results are identical regardless of chunk
-        size.
+        size, with one bounded exception: the tie-correction sum is accumulated
+        exactly in int64 only while the relevant axis fits the cube bound of
+        2 097 151 cells, and there are **two** ways to exceed it — the reference
+        tie axis itself (``n_ref``, or all cells under ``ALL_OTHERS``), or the
+        POOLED sample ``n_ref + m`` even when the reference alone fits. Past
+        either, the sum falls back to a shape-sensitive float64 reduction and
+        ``p_value`` / ``p_adj`` may differ between chunk sizes (observed at
+        1-2 ULP; not a guaranteed bound). **gpudge does not warn when this
+        happens** -- the condition is data-dependent and cheap to reason about
+        from the sizes above, and the check cannot be made both per-invocation
+        and free in the per-(group, chunk) inner loop. If you need
+        bit-reproducible p-values at that scale, pin a ``gpu_gene_chunk_size``
+        that fits **and** pass ``oom_recovery=False``: that combination is what
+        fixes the reduction shape, which is what makes the float64 result
+        reproducible even though it is not exact. A pinned chunk alone is NOT
+        enough -- under the default ``oom_recovery=True`` an OOM halves even an
+        explicit chunk, and it can strike after earlier chunks have already
+        succeeded, so one run can mix reduction shapes.
     densify_input : bool, default False
         If True and ``adata.X`` is sparse, **mutate ``adata.X`` in place** to a
         dense numpy array before the chunk loop (i.e. ``adata.X =
@@ -573,10 +602,34 @@ def de(
         the sparse first (e.g. holding both in separate variables) makes this
         slower not faster, because both representations coexist; we do the
         replacement inside de() so the rebind drops the sparse refcount to 0.
-        Not supported together with an AnnData ``reference=`` (raises
-        ``ValueError``); the external reference is ranked resident on the GPU,
-        not densified in place.
+
+        **Rejected on a sparse ``AnnData`` view.** Assigning to a view's ``.X``
+        writes through to the parent instead of rebinding, so the dense array
+        would be built, scattered into the parent and then discarded -- the
+        caller pays the full allocation and the chunk loop still takes the
+        sparse branch. ``de()`` raises ``ValueError`` at a preflight rather than
+        burn the memory; pass ``adata.copy()`` (or ``adata.to_memory()``). A
+        view whose ``.X`` is already dense is unaffected -- there is nothing to
+        densify, so it is a no-op.
+
+        Which mode you are in decides all of this, and ``cell_source`` wins over
+        the reference type:
+
+        * ``adata`` + a group label or ``ALL_OTHERS`` -- everything above: a
+          materialized sparse ``X`` is densified in place with the warning, a
+          sparse view raises, an already-dense ``X`` is a no-op.
+        * ``adata`` + ``reference=<AnnData>`` -- raises, whatever ``adata.X``
+          is: the external reference is ranked resident on the GPU rather than
+          densified in place.
+        * ``archive`` -- raises. gpudge is streaming, not holding a matrix.
+        * ``cell_source`` -- **ignored**, including when the pool it is given is
+          an ``AnnData``. That branch returns early from ``de()`` before the
+          reference-type guards are reached, so nothing raises; gpudge is not the
+          one fetching the cells.
     cpm_normalize : bool, default False
+        Must be ``True`` or ``False`` (or a 0-d numpy/torch boolean); anything
+        else raises. Truthy coercion is refused deliberately, as for
+        ``tau_star_se`` -- ``cpm_normalize='false'`` would otherwise mean True.
         If True, normalize each cell to 1e6 total counts on the fly, inside
         the chunk loop. Row sums are computed once over the full X before
         the loop; each per-chunk slice is then multiplied by ``1e6 /
@@ -652,8 +705,15 @@ def de(
         importable, cupy's pools) to the CUDA driver on exit, so a same-process
         caller can allocate GPU memory after de() (otherwise the pools hold ~all
         of VRAM and the caller's next cudaMalloc / cuBLAS op can OOM). Pass
-        ``False`` to keep the caches resident (avoids re-allocating the resident
-        reference when calling de() repeatedly in a tight loop). ``gpudge_arc#76``.
+        ``False`` to keep the caches resident, so a tight loop of de() calls
+        re-uses a warm allocator instead of going back to the driver.
+        **That only holds for the plain in-memory path.** All three
+        external-reference paths (streaming, in-memory ``reference=<AnnData>``,
+        and ``cell_source``) trim both allocators at their reference-residency
+        guard before reading free VRAM, because cached-but-unused blocks from an
+        earlier de() made that hard guard refuse references that fit. So under
+        ``release_gpu_memory=False`` those paths still start each call cold.
+        ``gpudge_arc#76``.
 
     Returns
     -------
@@ -824,6 +884,17 @@ def de(
         )
     if not math.isfinite(epsilon) or epsilon < 0:
         raise ValueError(f"epsilon must be a finite value >= 0, got {epsilon!r}.")
+    if gpu_gene_chunk_size is not None:
+        # Unvalidated before: a 0 or a negative reached
+        # `run_gene_chunks_with_recovery` and raised about `initial_chunk`, a
+        # name no caller ever passes.
+        if (isinstance(gpu_gene_chunk_size, bool)
+                or not isinstance(gpu_gene_chunk_size, numbers.Integral)
+                or gpu_gene_chunk_size <= 0):
+            raise ValueError(
+                "gpu_gene_chunk_size must be a positive integer or None, got "
+                f"{gpu_gene_chunk_size!r}.")
+        gpu_gene_chunk_size = int(gpu_gene_chunk_size)
     lfc_combos = normalize_lfc_spec(lfc_threshold, lfc_threshold_alt)
     taustar_se = normalize_taustar_se(tau_star_se)
     taustar_levels = normalize_taustar_spec(tau_star, taustar_se=taustar_se)
@@ -847,6 +918,9 @@ def de(
             f"({ALL_OTHERS!r}). The one-vs-rest path ranks all cells jointly, "
             f"which has no per-reference distribution to shift by 2**tau. Use "
             f"an explicit reference (a group name or a control AnnData).")
+    # Strict bool BEFORE the pair-guard below: with bare truthiness
+    # cpm_normalize='false' both escaped this guard and turned CPM on.
+    cpm_normalize = normalize_cpm_flag(cpm_normalize)
     if cpm_normalize and normalize_target_sum is not None:
         raise ValueError(
             "only one of cpm_normalize / normalize_target_sum may be set "
@@ -1083,6 +1157,16 @@ def de(
             f"rest means). Use mean_calc='arithmetic' for {ALL_OTHERS!r}, "
             "or pick a literal reference group for geometric."
         )
+    # PREFLIGHT, before the CUDA probe, the CSR coercion, the row-sums pass and
+    # every host accumulator: densify_input cannot be honoured on a view, and
+    # rejecting it late meant the caller paid all of that first. (codex review)
+    if densify_input and getattr(adata, "is_view", False) and sp.issparse(adata.X):
+        raise ValueError(
+            "densify_input=True is not supported when adata is an AnnData "
+            "view: assigning to a view's .X writes through to the parent "
+            "instead of rebinding, so the dense array is paid for and then "
+            "discarded. Pass adata.copy() (or adata.to_memory()) instead.")
+
     if not torch.cuda.is_available():
         raise RuntimeError(
             "gpudge requires a CUDA GPU; "
@@ -1099,9 +1183,46 @@ def de(
     # numba CSR kernel, so coercing CSC there buys nothing and would only add a
     # per-chunk CSR->CSC round-trip — that path is a separately-scoped follow-up
     # (#66). Leaving ALL_OTHERS untouched keeps it byte-for-byte as before.
+    # Coercion target depends on whether ``adata`` can actually be rebound.
+    #
+    # MATERIALIZED AnnData: assign back to ``adata.X``, as the #66 design
+    # specifies. That is deliberate and load-bearing for MEMORY — it drops the
+    # caller's CSC/COO refcount so only one sparse encoding is live, and
+    # densify_input then frees that too. Holding a local CSR copy instead would
+    # keep BOTH encodings resident for the whole run and can turn a large
+    # supported CSC input into a host OOM.
+    #
+    # VIEW: rebinding is impossible. ``view.X = ...`` writes the value back
+    # THROUGH into the parent and re-reads the parent slice, so the coercion
+    # silently vanished (adata.X stayed a SparseCSCMatrixView) while ensure_csr's
+    # warning said it had happened — dropping every gather tile onto scipy
+    # slicing, the regression #66 added this line to prevent. A view therefore
+    # keeps a local CSR and accepts that the parent's encoding stays alive; that
+    # is the unavoidable cost of a view, not a regression on the common path.
+    #
+    # Assign ONLY when ensure_csr actually returned a different object: it passes
+    # an already-CSR X through unchanged, and assigning it back on a view would
+    # run a full O(n_obs x n_var) sparse scatter into the parent for nothing.
+    # (ultrareview 2026-08; view/materialized split per the codex review.)
     if reference != ALL_OTHERS:
         # stacklevel=3: de() -> ensure_csr -> warn points at the user's de() call.
-        adata.X = ensure_csr(adata.X, name="adata.X", stacklevel=3)
+        _coerced = ensure_csr(adata.X, name="adata.X", stacklevel=3)
+        if _coerced is adata.X:
+            _X_host = adata.X                      # already CSR: nothing to do
+        elif getattr(adata, "is_view", False):
+            _X_host = _coerced                     # cannot rebind a view
+        else:
+            adata.X = _coerced                     # in-place: frees the CSC
+            _X_host = adata.X
+        # MUST drop this local. Once _X_host is established, `_coerced` is a
+        # second strong reference to the sparse matrix that lives until de()
+        # returns — so densify_input's "the sparse matrix is dropped after this
+        # point" contract would silently fail to free anything, on BOTH the
+        # already-CSR and the coerced-materialized paths. Pinned by
+        # test_densify_input_releases_the_sparse_matrix. (codex review round 4.)
+        del _coerced
+    else:
+        _X_host = adata.X
 
     from ._filter import (
         _row_scale_needs, validate_keep_genes, x_has_noncount_signal,
@@ -1129,7 +1250,7 @@ def de(
         bool(cpm_normalize)
         or (normalize_target_sum is not None)
         or _cpm_filter_active)
-    _row_sums_np_early = (csr_row_sums(adata.X)
+    _row_sums_np_early = (csr_row_sums(_X_host)
                           if _need_row_sums_for_resolve else None)
     target_sum = resolve_target_sum(
         cpm_normalize=cpm_normalize,
@@ -1147,6 +1268,7 @@ def de(
 
     state = ingest(adata, groupby=groupby, reference=reference)
     n_groups = len(state.unique_labels)
+
     labels_t = torch.from_numpy(state.labels).to(device)
 
     # Auto-pick gene chunk size from free GPU memory if not provided.
@@ -1178,9 +1300,13 @@ def de(
         else:
             counts = np.bincount(state.labels, minlength=n_groups)
             budget_n = int(counts[state.ref_label_idx])
-            if n_combos or n_taustar_rows:
-                max_group_rows = int(
-                    np.delete(counts, state.ref_label_idx).max(initial=0))
+            # UNCONDITIONAL: the sizer models the Phase-1 target tile whenever it
+            # knows the tile height, so withholding the height here would leave
+            # the base literal-reference path with the very OOM the un-gating in
+            # _stream.py fixes. Gating this on `n_combos or n_taustar_rows` was
+            # the caller half of the same bug. (codex review, ultrareview 2026-08)
+            max_group_rows = int(
+                np.delete(counts, state.ref_label_idx).max(initial=0))
         gpu_gene_chunk_size = _auto_gene_chunk_size(
             free_bytes=free, budget_n=budget_n, n_groups=n_groups,
             mean_calc=mean_calc, n_genes=state.n_genes,
@@ -1226,7 +1352,19 @@ def de(
     # adata.X (not just hold a local reference) so the sparse refcount goes
     # to zero — keeping both representations alive at CCL_2 scale costs 310 GB
     # host and triggers severe paging.
-    if densify_input and sp.issparse(adata.X):
+    if densify_input and sp.issparse(_X_host):
+        # A view cannot satisfy this parameter's contract. Assigning to a view's
+        # .X writes through to the parent rather than rebinding, so the dense
+        # array would be built, converted to COO, scattered into the parent and
+        # then discarded — the caller pays the full dense allocation (~310 GB peak
+        # at CCL_2 scale, per the docstring) and the chunk loop still takes the
+        # sparse branch. Fail loudly instead of burning the memory for nothing.
+        # (ultrareview 2026-08)
+        # Unreachable: the preflight above rejects views before any work. Kept
+        # so a future refactor that drops the preflight cannot silently restore
+        # the write-through no-op.
+        assert not getattr(adata, "is_view", False), \
+            "densify_input on a view should have been rejected at the preflight"
         warnings.warn(
             "densify_input=True: replacing adata.X (sparse) with a dense "
             "numpy array in place. The caller's AnnData is mutated; pass "
@@ -1234,7 +1372,8 @@ def de(
             UserWarning,
             stacklevel=2,
         )
-        adata.X = adata.X.toarray()
+        adata.X = _X_host.toarray()
+        _X_host = adata.X          # rebind succeeded (not a view): re-read it
 
     # Inline CPM/target-sum scaling. `csr_row_sums` handles both sparse-CSR and
     # dense X uniformly; scipy's `sum(axis=1)` alone is unusably slow on
@@ -1260,7 +1399,7 @@ def de(
     # Single non-count warning for cpm_* filters (raw-counts assumption): fire
     # once if a sampled value is fractional/negative OR any row sum < 0.
     if _cpm_filter_active:
-        _noncount = x_has_noncount_signal(adata.X)
+        _noncount = x_has_noncount_signal(_X_host)
         if not _noncount and row_sums_np is not None:
             _noncount = bool((row_sums_np < 0).any())
         if _noncount:
@@ -1280,7 +1419,7 @@ def de(
         group_libtot = None
 
     if state.ref_label != ALL_OTHERS:
-        X_host = adata.X
+        X_host = _X_host
         # Pre-compute per-group row indices once (avoids repeated
         # np.flatnonzero inside the gene-chunk loop). One stable argsort +
         # boundary split instead of n_groups full-array scans; stable sort keeps
@@ -1303,7 +1442,7 @@ def de(
             group_rows_t = None
 
     else:
-        X_host = adata.X
+        X_host = _X_host
 
     if state.ref_label == ALL_OTHERS:
         # all_others path: 1-vs-rest, needs global ranks across all cells.
@@ -1333,11 +1472,11 @@ def de(
 
         def _process_gene_chunk_ao(start, stop):
             ch_genes = stop - start
-            if sp.issparse(adata.X):
-                block = (adata.X[:, start:stop].tocsc()
+            if sp.issparse(_X_host):
+                block = (_X_host[:, start:stop].tocsc()
                          .toarray().astype(np.float32, copy=False))
             else:
-                block = np.ascontiguousarray(adata.X[:, start:stop],
+                block = np.ascontiguousarray(_X_host[:, start:stop],
                                              dtype=np.float32)
             X_chunk = torch.from_numpy(block).to(device, non_blocking=True)  # UNSCALED
 
@@ -1670,19 +1809,27 @@ def de(
             oom_recovery=oom_recovery,
         )
 
-    if state.ref_label == ALL_OTHERS:
-        rm_b = ref_mean_acc
-    else:
-        rm_b = np.broadcast_to(ref_mean_acc, target_mean_acc.shape)
-    log2fc = np.log2((target_mean_acc + epsilon) / (rm_b + epsilon))
+    # `ref_mean_acc` unbroadcast in BOTH modes: it is already
+    # (n_groups, n_genes) under ALL_OTHERS and (n_genes,) otherwise, and
+    # log2_ratio scans its inputs to decide whether the only reachable warnings
+    # are the documented epsilon=0 ones -- the unbroadcast array says the same
+    # thing for a fraction of the work. Broadcasting still happens in the divide.
+    log2fc = log2_ratio(target_mean_acc, ref_mean_acc, epsilon)
 
     if state.ref_label == ALL_OTHERS:
         target_indices = np.arange(n_groups)
         target_labels = state.unique_labels
     else:
         keep_mask_acc[state.ref_label_idx] = False
+        # dtype=np.intp is load-bearing: on a reference-only input (the sole
+        # group IS the reference) this list is EMPTY, an untyped `np.array([])`
+        # is float64, and numpy refuses a float array as an index -- so the
+        # whole GPU pass ran and then died here with
+        # `IndexError: arrays used as indices must be of integer (or boolean)
+        # type`. With the dtype the tail builds the canonical empty frame.
         target_indices = np.array(
-            [i for i in range(n_groups) if i != state.ref_label_idx]
+            [i for i in range(n_groups) if i != state.ref_label_idx],
+            dtype=np.intp,
         )
         target_labels = state.unique_labels[target_indices]
 

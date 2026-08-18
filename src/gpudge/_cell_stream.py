@@ -5,7 +5,9 @@ import logging
 
 import numpy as np
 
+from ._ingest import reject_missing_group_labels
 from ._csr_dense import csr_row_sums
+from ._stream_backend import validate_archive_reference
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,16 @@ def _cell_group_ranges(store):
         raise ValueError(
             f"{store.path}: duplicate group labels {sorted(dup)} in the group table."
         )
+    # An unassigned cell reaches the archive as a group literally named 'nan'
+    # (shardad stringifies the obs column at write time), which the in-memory
+    # path refuses at _ingest.py's source-level guard. Screen the strings here so
+    # the two paths agree instead of streaming a bogus perturbation block.
+    # Reading store.obs[group_by] to test isna() is exactly the whole-obs load
+    # this function exists to avoid, so the string level is the right level.
+    # (ultrareview 2026-08)
+    reject_missing_group_labels(
+        labels, where=str(store.path),
+        remedy="Drop or assign the unassigned cells before writing the archive.")
     pos = 0
     for lab, start, stop in ranges:
         if start != pos or stop < start:
@@ -231,14 +243,8 @@ class _CellBackend:
                 "reference=<AnnData>, or re-write the archive with "
                 "shardad.write_sharded(..., reference=<label(s)>)."
             )
-        if reference is not None and str(reference) not in set(labels):
-            raise ValueError(
-                f"reference={reference!r} is not among the archive's reference "
-                f"labels {sorted(labels)}."
-            )
+        msg_label = validate_archive_reference(reference, labels)
         ref_X = self._gather(0, self._ref_stop)
-        msg_label = (str(reference) if reference is not None
-                     else "|".join(sorted(labels)))
         return ref_X, msg_label
 
     def targets(self):

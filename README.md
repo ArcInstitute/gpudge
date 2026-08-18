@@ -17,8 +17,18 @@ Arc VCI pipeline uses.
 
 ## Performance
 
-Benchmarked on **NVIDIA H100 80 GB** unless noted (gpudge v0.1–v0.2; the
-Mann–Whitney DE core is unchanged in v0.3.0). gpudge runs the whole test as
+> **`CCL_1` and `CCL_2`** are two in-house CRISPRi perturbation screens on human
+> cancer cell lines, anonymised for this release. Every table below gives their
+> dimensions; nothing in the library depends on them, they are simply the data
+> the timings and the parity checks were measured on.
+
+Benchmarked on **NVIDIA H100 80 GB** unless noted. These numbers were taken at
+different points in the project's history — the four-engine comparison below at
+v0.1–v0.2; the full-matrix and narrowed-in-memory rows at v0.3.0; the
+decode-ahead default-streaming row, the current serial timing and the
+`stream_n_workers` trade at v0.4.0 — and none has been re-measured since. The CHANGELOG's
+per-release performance entries are the source of truth. gpudge runs
+the whole test as
 **one GPU pass**, so its **DE time is near-constant in the number of
 perturbations** — where per-group tools (scanpy, rapids-singlecell) scale
 roughly linearly.
@@ -89,7 +99,10 @@ rate) and bit-perfect vs CPU pdex on log2FC/p-value.
 
 ## Install
 
-Requires CUDA 12.6+, an H100 / A100 / Hopper GPU, and an NVIDIA driver. The
+Requires CUDA 12.6+, an NVIDIA driver, and a CUDA GPU with enough VRAM for the
+reference pool — there is no CPU fallback. Developed and benchmarked on H100
+80 GB and A100 40 GB, and the pre-release GPU gate runs the `[dev,fast]` suite
+on an **L4 (sm_89)**, where 13 `de()` scenarios are byte-identical to sm_90. The
 core library takes an **in-memory `AnnData`** and has **no private
 dependencies**.
 
@@ -98,10 +111,14 @@ dependencies**.
 ```bash
 # torch's CUDA 12.6 build is pulled from the PyTorch index:
 pip install --extra-index-url https://download.pytorch.org/whl/cu126 \
-  "gpudge[fast] @ git+ssh://git@github.com/ArcInstitute/gpudge.git@v0.7.0"
+  "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.7.0"
 ```
 
 Requires **Python ≥ 3.11**.
+
+> **Not on PyPI yet.** The name `gpudge` is held there by a 0.0.1 reservation
+> stub with none of this library's functionality, so a bare `pip install gpudge`
+> installs that stub. Use the pin above until a real release is published.
 
 Extras:
 - **`[fast]`** — adds `numba` (parallel single-pass CSR row-gather; ~3× faster on
@@ -136,17 +153,27 @@ Extras:
 ### uv (recommended for development)
 
 ```bash
-git clone git@github.com:ArcInstitute/gpudge.git && cd gpudge
-uv sync --extra fast          # reads [tool.uv.sources]: torch=cu126 index, shardad git pin
+git clone https://github.com/ArcInstitute/gpudge.git && cd gpudge
+uv venv && uv pip install --torch-backend=cu126 -e ".[dev,fast]"
 ```
-`uv sync --extra streaming` additionally pulls shardad from its git pin. uv reads
-`[tool.uv.sources]`, so it resolves the cu126 torch and the private shardad
-automatically (no manual `--extra-index-url` needed).
+
+Use `uv pip install`, **not `uv sync`**, unless you have SSH access to the
+private `shardad` repository. `uv sync` builds uv's universal lock, which
+resolves every entry in `[tool.uv.sources]` — including the `shardad` git-SSH
+source — even when you did not ask for the `streaming` extra, and fails with
+`Permission denied (publickey)` without a key. `uv pip install` resolves only
+the extras you requested. This is what CI does, and why.
+
+`--torch-backend=cu126` (uv ≥ 0.7.3) is needed because `uv pip install` skips
+`[tool.uv.sources]` too, so without it torch comes from PyPI. CI omits the flag
+deliberately — it is CPU-only.
+
+With that access, `uv sync --extra streaming` does work and pulls shardad and
+the cu126 torch build from their pins with no manual `--extra-index-url`.
 
 ### conda / mamba
 
-There is no conda package (gpudge is private; conda-forge is for public
-packages). Use conda/mamba to **manage the environment**, then let pip install
+There is no conda-forge package. Use conda/mamba to **manage the environment**, then let pip install
 gpudge into it — [`environment.yml`](environment.yml) does both:
 
 ```bash
@@ -160,12 +187,12 @@ a CUDA toolkit — only a host NVIDIA driver + GPU.)
 ## Usage
 
 ```python
-import scanpy as sc
+import anndata as ad
 from gpudge import de
 
 # CCL_2 CRISPRi screen (2.06 M cells), raw counts. Perturbation labels are in
 # adata.obs["target_gene"]; non-targeting controls are labelled "non-targeting".
-adata = sc.read_h5ad("screen.h5ad")
+adata = ad.read_h5ad("screen.h5ad")
 
 result = de(
     adata,
@@ -199,6 +226,32 @@ result = de(adata, groupby="target_gene", reference=ALL_OTHERS)
 
 (The pre-v0.1 spelling `reference="all_others"` is still accepted with a
 `DeprecationWarning` and will be removed in a future release.)
+
+### Effect-size floor: `lfc_threshold`
+
+A small p-value only says "not exactly equal". `lfc_threshold` adds one-sided
+tests against a real effect-size floor, applied at the rank level — the target
+is compared against `reference * 2**(±τ)`:
+
+```python
+res = de(adata, groupby="target_gene", reference="non-targeting",
+         lfc_threshold=[0.25, 1.0],          # a whole grid, in ONE pass
+         lfc_threshold_alt=("up", "down"))   # the default; either alone is fine
+# adds, per (τ, direction):  tau=+0.25_p / _Ueffect / _padj   (H0: log2FC <= +0.25)
+#                            tau=-0.25_p / _Ueffect / _padj   (H0: log2FC >= -0.25)
+#                            tau=+1_…      tau=-1_…
+```
+
+The base two-sided `p_value` / `Ueffect` / `p_adj` columns are always emitted
+unchanged. Each (τ, direction) is its own BH family. τ is in log2 units, so it
+is directly comparable to `tau_star` and to DESeq2's `lfcThreshold`. Not
+supported with `ALL_OTHERS`.
+
+Three caveats the `de()` docstring spells out and you should read before
+relying on this: the rank direction can flatly contradict the sign of
+`log2_fold_change`; τ is a *multiplicative* shift and `0 * 2**τ == 0`, so on
+high-dropout genes the effective floor is weaker than τ suggests; and the
+p-values are **not** guaranteed monotone in τ across tie transitions.
 
 ### Effect size on the rank axis: `tau_star`
 
@@ -342,24 +395,44 @@ result = de(
 See `de()` in `src/gpudge/__init__.py`. gpudge also exports the `MeanCalc`
 type alias (the `mean_calc` literal) and `__version__`.
 
+Every keyword parameter, grouped. `adata` is the sole positional.
+
 | Kwarg | Default | Meaning |
 |---|---|---|
-| `groupby` | required | column in `adata.obs` |
-| `reference` | required | group name or `ALL_OTHERS` (= `"__all_others__"`); legacy `"all_others"` accepted with `DeprecationWarning` |
+| **Comparison** ||
+| `groupby` | `None` | column in `adata.obs`. Required with `adata=`; auto-resolved from the manifest with `archive=`; must be omitted with `cell_source=`, which raises if it is passed |
+| `reference` | `None` | a group name, `ALL_OTHERS` (= `"__all_others__"`), or a control-pool `AnnData`. Required with `adata=` and with `cell_source=`. With `archive=` it may be omitted **only if the archive designates its own reference**; otherwise pass an external `AnnData` pool. With `cell_source=` it is the pool itself and may also be a bare cells × genes numpy/scipy matrix. Legacy `"all_others"` accepted with `DeprecationWarning` |
 | `mean_calc` | `"arithmetic"` | one of `arithmetic`, `geometric` |
 | `epsilon` | `1e-9` | matches `scanpy.tl.rank_genes_groups` |
+| **Where the cells come from** ||
+| `archive` | `None` | stream a shardad archive instead of an in-memory `adata`; both layouts, detected from the manifest |
+| `shard_archive` | `None` | deprecated spelling of `archive=`; still accepted, emits a `DeprecationWarning` |
+| `cell_source` | `None` | callable yielding one `CellGroup(label, X, rows=None)` per target group |
+| `targets` | `None` | ordered target labels; required with `cell_source=`, and defines output row order |
+| `var_names` | `None` | gene names; required with `cell_source=` |
+| **Per-gene filters** (all opt-in, AND-combined) ||
 | `filter_gene_min_mean_value` | `None` | per-(group, gene) mean filter on `adata.X` as supplied; unit-agnostic |
 | `filter_gene_min_total_value` | `None` | per-(group, gene) sum filter on `adata.X` as supplied; unit-agnostic |
 | `filter_gene_min_cpm_cell` | `None` | per-cell CPM filter (assumes raw counts; warns on non-integer X) |
 | `filter_gene_min_cpm_bulk` | `None` | pooled bulk CPM filter (assumes raw counts; same warning) |
-| `keep_genes` | `None` | per-gene `np.bool_` mask aligned to `var_names`; AND-combined with other filters |
+| `keep_genes` | `None` | per-gene `np.bool_` mask aligned to `var_names` |
+| **Effect size** ||
+| `lfc_threshold` | `None` | τ, or a finite iterable of τ, in log2 units (0 ≤ τ ≤ 30); adds `tau=<±τ>_{p,Ueffect,padj}`. Not supported with `ALL_OTHERS` |
+| `lfc_threshold_alt` | `("up", "down")` | which one-sided alternatives to emit per τ |
 | `tau_star` | `None` | one-sided `p_dir` levels in the open interval (0, 1); emits a signed `tau*_p<level>` log2 shift per (target, gene). Not supported with `ALL_OTHERS` |
 | `tau_star_iters` | `None` | bisection steps per level (default 20); validated even when `tau_star` is unset |
-| `gpu_gene_chunk_size` | `None` | auto-pick from free GPU memory |
-| `oom_recovery` | `True` | on CUDA OOM, halve the gene-chunk and retry (floor 64, or `chunk//2` if smaller); `False` = strict raise (benchmarking) |
-| `densify_input` | `False` | mutate `adata.X` to dense in place (emits `UserWarning`); faster per-group slicing when host RAM permits |
+| `tau_star_se` | `False` | adds `tau*_lo_p0.025`, `tau*_hi_p0.025`, `tau*_se`; requires `tau_star`, and forces `0.5` into the level set |
+| **Normalization** ||
 | `cpm_normalize` | `False` | inline CPM scaling (skips an upfront `sc.pp.normalize_total`); does *not* mutate `adata.X` |
 | `normalize_target_sum` | `None` | inline scanpy-compatible library-size normalization; pass a positive number or `"median"`; mutually exclusive with `cpm_normalize=True` |
+| **Execution** ||
+| `gpu_gene_chunk_size` | `None` | auto-pick from free GPU memory |
+| `oom_recovery` | `True` | on CUDA OOM, halve the gene-chunk and retry (floor 64, or `chunk//2` if smaller); `False` = strict raise (benchmarking) |
+| `densify_input` | `False` | in-memory group-label / `ALL_OTHERS` path only. There: materialized sparse → densified in place with a `UserWarning` (faster per-group slicing when host RAM permits); sparse view → raises; already-dense → no-op. `archive=`, and `adata=` with `reference=<AnnData>`, both raise. `cell_source=` **ignores** it, including when its pool is an `AnnData` |
+| `release_gpu_memory` | `True` | return torch's (and cupy's) caching-allocator pools to the driver on exit, so a same-process caller can allocate afterwards |
+| `stream_n_workers` | `16` | shard layout: decode-ahead workers (~14 GB host RAM each). Cell layout: the Rust gather's thread count (no extra host RAM) |
+| `stream_prefetch` | `2` | shard layout: decode-ahead queue depth; `0` is the serial, lowest-RAM path. No effect on cell layout |
+| **Output** ||
 | `output_columns` | `None` | rename + select dict; raises `KeyError` on unknown keys |
 
 ## Design

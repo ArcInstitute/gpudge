@@ -53,3 +53,27 @@ def test_ingest_legacy_all_others_string_is_deprecated_but_works(synth_small):
                        reference="all_others")
     assert state.ref_label == ALL_OTHERS
     assert state.ref_label_idx is None
+
+
+def test_reject_missing_group_labels_policy():
+    """One shared policy for the stringified-missing-value labels, used by both
+    streaming backends. Discriminating in BOTH directions: the four reachable
+    spellings must raise, and the three that .astype(str) cannot produce must be
+    ACCEPTED -- rejecting those refused archives the in-memory path accepts.
+    (ultrareview 2026-08; set narrowed after the codex review.)
+    """
+    import pytest
+    from gpudge._ingest import (
+        MISSING_LABEL_SPELLINGS, reject_missing_group_labels,
+    )
+    kw = dict(where="X.csad", remedy="Drop them.")
+    for bad in ("nan", "None", "<NA>", "NaT"):
+        with pytest.raises(ValueError, match="missing"):
+            reject_missing_group_labels(["g1", bad], **kw)
+    # Cannot arise from the conversion -> must NOT be rejected.
+    for ok in ("NaN", "NAN", "", "nan_cluster", "None_of_the_above"):
+        reject_missing_group_labels(["g1", ok], **kw)
+    assert MISSING_LABEL_SPELLINGS == {"nan", "None", "<NA>", "NaT"}
+    # The message must name the offender and say a real group can be renamed.
+    with pytest.raises(ValueError, match=r"rename"):
+        reject_missing_group_labels(["nan"], **kw)

@@ -50,14 +50,77 @@ Implementations:
 from __future__ import annotations
 
 
+def validate_archive_reference(reference, labels):
+    """Validate ``reference=`` against an archive's OWN reference labels.
+
+    Returns the message label to report. Raises ``ValueError`` on an unknown
+    label.
+
+    Both backends gather the reference pool WHOLE -- the cell backend reads
+    ``[0, ref_stop)``, the shard backend reads its reference shard -- so
+    ``reference=`` here NAMES the pool rather than subsetting it. That is
+    deliberate and specified: "``reference=<label>`` is validated for membership
+    in the reference labels and otherwise does not subset -- the pool is all
+    reference rows".
+    A single label against a multi-label pool is therefore ACCEPTED, unchanged.
+
+    What this helper fixes is the sequence case. ``reference=['ntc', 'safe']``
+    was stringified whole by the old membership test, so a list that exactly
+    matched the archive's labels produced the self-contradictory
+    ``reference=['ntc', 'safe'] is not among the archive's reference labels
+    ['ntc', 'safe']``. A sequence is now checked element-wise.
+    """
+    def _label(x):
+        return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+    label_list = sorted(labels)
+    if reference is None:
+        return "|".join(label_list)
+    # str/bytes are sequences; test them first or 'ntc' iterates to
+    # {'n','t','c'}. `str(...)` on the str arm too: np.str_ passes the
+    # isinstance check (it subclasses str) and would otherwise leak out as
+    # np.str_ rather than a plain label.
+    if isinstance(reference, (str, bytes, bytearray)):
+        named = [_label(reference)]
+    else:
+        # iter(), not isinstance(_, Iterable): a 0-d np.array('ntc') passes the
+        # Iterable check via __getitem__ and then raises TypeError when
+        # iterated. Materialized in one pass -- `reference` may be a generator,
+        # and it is read twice below (membership, then the message).
+        try:
+            named = [_label(x) for x in iter(reference)]
+        except TypeError:
+            # A 0-d array: unwrap it rather than str()-ing the array, or
+            # np.array(b"ntc") becomes the literal "np.bytes_(b'ntc')".
+            item = (reference.item()
+                    if getattr(reference, "ndim", None) == 0 else reference)
+            named = [_label(item)]
+    if not named:
+        raise ValueError(
+            f"reference={reference!r} is an empty sequence. Pass reference=None "
+            f"to use the archive's reference pool {label_list}, or name it."
+        )
+    unknown = sorted(set(named) - set(label_list))
+    if unknown:
+        raise ValueError(
+            f"reference={reference!r} is not among the archive's reference "
+            f"labels {label_list}."
+        )
+    # The pool is used whole either way, so the label reported for it is the
+    # caller's when they named exactly one and the joined set otherwise.
+    return named[0] if len(set(named)) == 1 else "|".join(label_list)
+
+
 def _import_shardad():
     try:
         import shardad
     except ImportError as e:  # pragma: no cover - exercised via monkeypatch
         raise ImportError(
-            "de(archive=...) requires the optional 'streaming' extra. "
-            "Install with `pip install gpudge[streaming]` or "
-            "`uv sync --extra streaming`."
+            "de(archive=...) requires the optional 'streaming' extra, which "
+            "installs shardad. shardad is hosted privately at "
+            "ArcInstitute/shardad and is not published on PyPI, so the extra "
+            "only resolves with access to that repository -- see the Install "
+            "section of the README for the exact pin."
         ) from e
     return shardad
 

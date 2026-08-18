@@ -26,8 +26,17 @@ them into the reference with `--collapse-reference-prefix non-targeting`.
 
 Two environments, because the tools have incompatible CUDA stacks:
 
-- **gpudge** (its own venv): `pip install "gpudge[fast]"` (the `[fast]` extra
-  brings in the numba CSR kernel) plus a CUDA build of PyTorch.
+- **gpudge** (its own venv): install this checkout, from the repository root —
+
+  ```bash
+  uv venv && uv pip install --torch-backend=cu126 -e ".[dev,fast]"
+  ```
+
+  `[fast]` brings in the numba CSR kernel and `--torch-backend` selects the CUDA
+  build of PyTorch. Install `[dev]` too, not just `[fast]`: `_load.py` imports
+  `scanpy`, which is a `[dev]` dependency. Do **not** `pip install gpudge` from
+  PyPI — the name is held there by a 0.0.1 reservation stub with none of this
+  library's functionality.
 - **rapids-singlecell #636** (a separate conda/micromamba env): install the
   branch's CI-built `rapids-singlecell-cu12` wheel from
   [PR #636](https://github.com/scverse/rapids-singlecell/pull/636) on top of a

@@ -6,6 +6,19 @@ readme = "README.md"
 authors = [{ name = "Arc Institute" }]
 license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = [
+    "single-cell", "differential-expression", "mann-whitney", "wilcoxon",
+    "crispr", "perturbation-screen", "gpu", "cuda",
+]
+# No `License ::` classifier: the `license` key above already carries it, and
+# declaring both is what PEP 639 deprecates.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     "anndata>=0.12",
     "hdf5plugin>=6.0.0",
@@ -15,6 +28,12 @@ dependencies = [
     "scipy>=1.17",
     "torch>=2.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ArcInstitute/gpudge"
+Repository = "https://github.com/ArcInstitute/gpudge"
+Changelog = "https://github.com/ArcInstitute/gpudge/blob/main/CHANGELOG.md"
+Issues = "https://github.com/ArcInstitute/gpudge/issues"
 
 [project.optional-dependencies]
 # ruff is UPPER-BOUNDED on purpose. CI installs fresh (`uv pip install -e

@@ -3,12 +3,14 @@ name: CI
 # CPU test + lint gate for gpudge.
 #
 # What runs here vs. what skips:
-#   - GPU-gated tests (the `needs_cuda` marker in tests/conftest.py) skip on
-#     the CPU runner.
-#   - The shardad streaming suites (tests/test_shard_stream.py,
-#     tests/test_cell_stream.py, tests/test_inmem_external_ref_gpu.py) are each
-#     gated behind a module-level `pytest.importorskip("shardad")`, so all three
-#     files skip entirely without the private `[streaming]` extra.
+#   - GPU-gated tests (the `needs_cuda` skipif in tests/conftest.py — a skipif,
+#     not a registered marker, so `pytest -m needs_cuda` selects nothing) skip
+#     on the CPU runner.
+#   - The three shardad-gated suites (tests/test_shard_stream.py,
+#     tests/test_cell_stream.py, tests/test_inmem_external_ref_gpu.py) each
+#     carry a module-level `pytest.importorskip("shardad")`, so all three files
+#     skip entirely without the private `[streaming]` extra. Between them that
+#     is 141 cases, 70 of which need no GPU.
 #   - The real-data tests (tests/test_real_data.py) skip when the dataset path
 #     is absent (it always is on CI).
 # So this job goes green on a stock CPU runner with no GPU and without the

@@ -23,10 +23,32 @@ from ._taustar import TAUSTAR_SE_COLUMNS, TAUSTAR_SE_LEVEL
 SQRT2 = math.sqrt(2.0)
 
 # Tie-term scratch budget (elements): _tie_term_per_gene processes genes in
-# blocks of `_TIE_BLOCK_ELEMS // k` so the O(block x k) int64 run_id + f64 ones
-# scratch stays bounded for a wide reference pool. Exposed as a module constant
+# blocks of `_TIE_BLOCK_ELEMS // k` so the O(block x k) int64 run_id and the
+# `acc_dtype` (int64, or f64 past the exact bound) ones scratch stay bounded for
+# a wide reference pool. Exposed as a module constant
 # so tests can force the multi-block path (otherwise block >= n_genes). (L10)
 _TIE_BLOCK_ELEMS = 64_000_000
+
+# Largest tie-axis length for which Σ(t^3 - t) is exact in int64. t is an integer
+# run length, so Σ(t^3 - t) <= (Σt)^3 = k^3, and k^3 fits a signed 64-bit integer
+# for k <= 2_097_151 (2_097_152**3 == 2**63, one past the maximum). Below this,
+# accumulating the tie term in int64 makes the reduction ORDER-FREE, which is what
+# de()'s chunk-invariance contract needs; above it we fall back to float64 and
+# inherit float64's shape-sensitivity. See _tie_term_per_gene. (ultrareview 2026-08)
+_TIE_INT64_MAX_K = 2_097_151
+
+# Tie-correction exactness bound: see `tie_acc_dtype` and `_tie_exact`. gpudge does
+# NOT warn when it falls back to float64 -- the condition is documented in de()'s
+# `gpu_gene_chunk_size` docstring instead. Four review rounds went into a diagnostic
+# for it and every shape was wrong: warning from the kernels put a frame walk and an
+# eager f-string in the (group x chunk) nested loops; throttling that with module
+# state was not per-invocation and interacted badly with `ignore`/`error` filters;
+# and a hardcoded stacklevel named gpudge internals on the streaming paths. It guards
+# a condition needing a >2e6-cell tie axis, it never changed a computed value, and the
+# machinery was the least-verified part of the change -- so it was dropped in favour
+# of documenting the limitation. Do not re-add a warning here without solving
+# per-invocation scoping and hot-loop cost together; `tests/test_mwu.py`'s
+# `test_kernels_never_warn_about_the_fallback` fails loudly if someone tries.
 
 
 def _rank_with_ties(
@@ -59,23 +81,45 @@ def _rank_with_ties(
     max_tgroups = int(group_id[-1].max().item()) + 1
     rank_sum_buf = torch.zeros((max_tgroups, n_genes), dtype=torch.float64,
                                device=device)
-    rank_cnt_buf = torch.zeros((max_tgroups, n_genes), dtype=torch.float64,
+    # Tie counts in int64 so the tie term at the bottom of this function reduces
+    # order-free: `max_tgroups` is a per-chunk maximum, so a float64 reduction
+    # would make a gene's tie term depend on its chunk-mates. Rank SUMS stay
+    # float64 — they are sums of integers well below 2**53 (N(N+1)/2), so every
+    # partial sum is exact and the order cannot matter. See _tie_term_per_gene.
+    cnt_dtype = torch.int64 if N <= _TIE_INT64_MAX_K else torch.float64
+    rank_cnt_buf = torch.zeros((max_tgroups, n_genes), dtype=cnt_dtype,
                                device=device)
     rank_sum_buf.scatter_add_(0, group_id, pos)
-    rank_cnt_buf.scatter_add_(0, group_id, torch.ones_like(pos))
-    avg_per_group = rank_sum_buf / rank_cnt_buf.clamp_min(1)
+    rank_cnt_buf.scatter_add_(0, group_id,
+                              torch.ones_like(group_id, dtype=cnt_dtype))
+    avg_per_group = rank_sum_buf / rank_cnt_buf.clamp_min(1).to(torch.float64)
 
     # Ranks in sorted order, then undo sort to get per-cell ranks
     ranks_sorted = avg_per_group.gather(0, group_id)   # (n_cells, n_genes)
     inv_idx = sort_idx.argsort(dim=0)
     ranks = ranks_sorted.gather(0, inv_idx)            # (n_cells, n_genes)
 
-    tie_term = ((rank_cnt_buf ** 3) - rank_cnt_buf).sum(dim=0)  # (n_genes,)
+    tie_term = ((rank_cnt_buf ** 3) - rank_cnt_buf).sum(dim=0).to(torch.float64)
     return ranks, tie_term
+
+
+def tie_acc_dtype(k: int) -> torch.dtype:
+    """Accumulator dtype ``_tie_term_per_gene`` will use for a tie axis of ``k``.
+
+    A pure function so callers that must pre-allocate a matching buffer (the
+    streaming reference prepass) do not have to run a throwaway tie computation
+    to find out -- which also emitted a spurious fallback warning. Single source
+    of truth for the bound. (codex review round 2/3.)
+    """
+    return torch.int64 if k <= _TIE_INT64_MAX_K else torch.float64
 
 
 def _tie_term_per_gene(sorted_values: torch.Tensor) -> torch.Tensor:
     """Σ(t^3 - t) per gene for a (n_genes, k) tensor sorted along dim=1.
+
+    Returns **int64** when ``k <= _TIE_INT64_MAX_K`` (the exact, order-free
+    regime) and float64 above it. Callers must combine it with a cross-tie delta
+    through ``_pool_tie`` rather than adding it to a float64 tensor directly.
 
     Vectorized: mark tie-run boundaries along the sorted axis, count run
     lengths with one scatter_add, then Σ(t^3 - t) per row. Replaces a Python
@@ -83,11 +127,45 @@ def _tie_term_per_gene(sorted_values: torch.Tensor) -> torch.Tensor:
     per chunk at CCL_2 scale). (ultrareview perf.)
     """
     n_genes, k = sorted_values.shape
-    out = torch.zeros(n_genes, dtype=torch.float64,
-                      device=sorted_values.device)
-    if n_genes == 0 or k == 0:
-        return out                                      # no ties possible
-    # Process genes in blocks so the O(block x k) int64 run_id + f64 ones
+    if n_genes == 0 or k == 0:                          # no ties possible
+        # dtype MUST follow tie_acc_dtype like the non-empty path: returning
+        # float64 here would make an empty chunk report the non-exact regime to
+        # _tie_exact and silently drop the pooled sum onto float64 arithmetic.
+        # (Copilot review, PR #124.)
+        return torch.zeros(n_genes, dtype=tie_acc_dtype(k),
+                           device=sorted_values.device)
+    # Σ(t^3 - t) accumulates in int64, NOT float64, whenever k allows it. This is
+    # a CORRECTNESS requirement, not an optimisation: torch's row sum is shape-
+    # sensitive, and `counts` is allocated (block_height, n_runs) where BOTH are
+    # per-block quantities — n_runs is the max run count over the genes in this
+    # block, and the last block of a chunk is short. So once Σ(t^3 - t) passed
+    # 2**53 (one tie run of ~2.1e5 cells) a gene's tie term moved with which genes
+    # shared its block, and de() returned bit-differing p_value / p_adj for the
+    # same data at two gpu_gene_chunk_size values — falsifying the chunk-
+    # invariance contract that tests/test_api.py and test_taustar_integration.py
+    # assert. Integer accumulation is order-free, so the shape cannot matter.
+    # Fixing only the zero-pad WIDTH does not work: block height still varies.
+    #
+    # Two different scopes, do not conflate them:
+    #   * CHUNK-DEPENDENCE needed the block's max run COUNT to swing across the
+    #     ~1e5 boundary, which needs continuous reference values -- so it was
+    #     reachable on the normalized paths (cpm_normalize / normalize_target_sum)
+    #     and measured at 0/64 rows on raw counts.
+    #   * The VALUE CHANGE vs 0.7.0 is wider: it lands wherever a single run
+    #     makes Sum(t^3 - t) exceed 2**53 (one run of ~2.1e5 cells), which RAW
+    #     COUNTS routinely do via the zero run. Those runs now get the exact
+    #     integer answer instead of a float64 approximation.
+    # (ultrareview 2026-08; scope corrected by the codex review.)
+    #
+    # RETURNS int64 in the exact regime. The dtype is load-bearing, not
+    # cosmetic: the pooled tie term is `ref_tie_term + cross_delta`, and the
+    # cross delta subtracts f(rc) to cancel the reference's own contribution.
+    # float64 cannot represent f(rc) past 2**53, so casting here and cancelling
+    # there leaves a residue of a full pooled ULP. `_tie_exact` / `_pool_tie`
+    # keep both sides integral and cast ONCE, after the sum.
+    acc_dtype = tie_acc_dtype(k)
+    out = torch.zeros(n_genes, dtype=acc_dtype, device=sorted_values.device)
+    # Process genes in blocks so the O(block x k) int64 run_id + ones
     # scratch (~16 B/elem) stays bounded for a wide reference pool — it must
     # not balloon past the gene chunk's own ranking buffers. (Codex review.)
     block = max(1, min(n_genes, _TIE_BLOCK_ELEMS // k))
@@ -97,10 +175,10 @@ def _tie_term_per_gene(sorted_values: torch.Tensor) -> torch.Tensor:
         new_run[:, 1:] = sv[:, 1:] != sv[:, :-1]        # value changes
         run_id = new_run.cumsum(dim=1) - 1              # (block, k) run index
         n_runs = int(run_id[:, -1].max().item()) + 1
-        counts = torch.zeros((sv.shape[0], n_runs), dtype=torch.float64,
+        counts = torch.zeros((sv.shape[0], n_runs), dtype=acc_dtype,
                              device=sv.device)
         counts.scatter_add_(1, run_id,
-                            torch.ones_like(sv, dtype=torch.float64))
+                            torch.ones_like(sv, dtype=acc_dtype))
         out[s:s + block] = (counts ** 3 - counts).sum(dim=1)
     return out
 
@@ -193,7 +271,8 @@ def _u1_against(sorted_ref: torch.Tensor,
 
 
 def _cross_tie_delta(sorted_ref: torch.Tensor, group_sorted_like: torch.Tensor,
-                     gc: torch.Tensor, run_start: torch.Tensor) -> torch.Tensor:
+                     gc: torch.Tensor, run_start: torch.Tensor, *,
+                     exact: bool = False) -> torch.Tensor:
     """Cross-group tie contribution to sum(t^3 - t), per gene.
 
     MUST be recomputed against the SCALED target for each (tau, direction):
@@ -203,25 +282,64 @@ def _cross_tie_delta(sorted_ref: torch.Tensor, group_sorted_like: torch.Tensor,
     under float64 scaling (spec 3.4a) and are passed in unchanged.
     """
     rl, rr = _bounds(sorted_ref, group_sorted_like)
-    rc = (rr - rl).to(torch.float64)
-    return _tie_delta_from_rc(rc, gc, run_start)
+    rc = (rr - rl).to(torch.int64 if exact else torch.float64)
+    return _tie_delta_from_rc(rc, gc, run_start, exact=exact)
 
 
 def _tie_delta_from_rc(rc: torch.Tensor, gc: torch.Tensor,
-                       run_start: torch.Tensor) -> torch.Tensor:
+                       run_start: torch.Tensor, *,
+                       exact: bool = False) -> torch.Tensor:
     """sum(t^3 - t) contributed by merging reference counts ``rc`` into the
     target's tie runs. Shared by the measured (``_cross_tie_delta``) and the
     generic (``_cross_tie_generic``) callers so the two cannot drift.
+
+    ``exact=True`` evaluates in int64 and returns int64. This is REQUIRED for
+    correctness whenever ``ref_tie_term`` is int64: the ``- (rc**3 - rc)`` here
+    must cancel the ``+ f(rc)`` inside the reference term BIT-FOR-BIT, and past
+    2**53 float64 cannot represent f(rc) at all. Evaluating one side exactly and
+    the other in float64 leaves a residue of a full ULP of the pooled term --
+    measured at r=416_134, gc=1 (a raw-count zero run): -16 on a value of
+    7.2e16. Both ``rc`` and ``gc`` are integer COUNTS regardless of the dtype
+    the values were compared in, so the cast is lossless. (codex review of the
+    ultrareview 2026-08 fix.)
     """
+    if exact:
+        rc = rc.to(torch.int64)
+        gc = gc.to(torch.int64)
     combined = rc + gc
     delta = combined ** 3 - combined - (rc ** 3 - rc)
     delta = torch.where(run_start, delta, torch.zeros_like(delta))
     return delta.sum(dim=1)
 
 
+def _tie_exact(ref_tie_term: torch.Tensor, m: int, n_ref: int) -> bool:
+    """May the pooled tie term be formed in exact integer arithmetic?
+
+    Needs BOTH that the reference term was accumulated exactly (int64) and that
+    the POOLED sample fits the cube bound -- the merged run length is bounded by
+    ``n_ref + m``, not by ``n_ref`` alone.
+
+    SILENT by design: this runs inside the (target group x gene chunk) nested
+    loops, and gpudge does not warn on the fallback at all -- the limitation is
+    documented in de()'s ``gpu_gene_chunk_size`` docstring. See the module comment.
+    """
+    if ref_tie_term.dtype != torch.int64:
+        return False
+    # The merged run length is bounded by the POOLED size, so that -- not n_ref
+    # alone -- is what has to fit the cube bound.
+    return (n_ref + m) <= _TIE_INT64_MAX_K
+
+
+def _pool_tie(ref_tie_term: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+    """ref + cross, summed in int64 when both are int64, then cast ONCE."""
+    if ref_tie_term.dtype == torch.int64 and delta.dtype == torch.int64:
+        return (ref_tie_term + delta).to(torch.float64)
+    return ref_tie_term.to(torch.float64) + delta.to(torch.float64)
+
+
 def _cross_tie_generic(group_sorted: torch.Tensor, gc: torch.Tensor,
-                       run_start: torch.Tensor,
-                       n0: torch.Tensor) -> torch.Tensor:
+                       run_start: torch.Tensor, n0: torch.Tensor, *,
+                       exact: bool = False) -> torch.Tensor:
     """Cross-group tie contribution at a GENERIC (non-coincident) shift.
 
     tau*'s load-bearing simplification (tau* spec 3.4). For a target tie-run
@@ -242,12 +360,13 @@ def _cross_tie_generic(group_sorted: torch.Tensor, gc: torch.Tensor,
     measure zero -- this is exactly why tau* is defined against the
     coincidence-free p-function ``p~`` rather than the measured one.
     """
+    _dt = torch.int64 if exact else torch.float64
     rc = torch.where(
         group_sorted == 0,
-        n0.unsqueeze(1).expand_as(group_sorted),
-        torch.zeros((), dtype=torch.float64, device=group_sorted.device),
+        n0.unsqueeze(1).expand_as(group_sorted).to(_dt),
+        torch.zeros((), dtype=_dt, device=group_sorted.device),
     )
-    return _tie_delta_from_rc(rc, gc, run_start)
+    return _tie_delta_from_rc(rc, gc, run_start, exact=exact)
 
 
 def _zero_counts(sorted_ref: torch.Tensor,
@@ -350,7 +469,7 @@ def _p_one_sided(stat: torch.Tensor, tie_term: torch.Tensor,
 
 def mwu_one_group(
     sorted_ref: torch.Tensor,    # (n_genes, n_ref) float32, sorted along dim=1
-    ref_tie_term: torch.Tensor,  # (n_genes,) float64
+    ref_tie_term: torch.Tensor,  # (n_genes,) int64 (exact) or float64
     group_T: torch.Tensor,       # (n_genes, m) float32
     n_ref: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -375,15 +494,17 @@ def mwu_one_group(
 
     u1 = _u1_against(sorted_ref, group_T)
     group_sorted, gc, run_start = _sorted_and_selfties(group_T)
-    tie_term = ref_tie_term + _cross_tie_delta(sorted_ref, group_sorted, gc,
-                                               run_start)
+    _ex = _tie_exact(ref_tie_term, m, n_ref)
+    tie_term = _pool_tie(ref_tie_term,
+                         _cross_tie_delta(sorted_ref, group_sorted, gc,
+                                          run_start, exact=_ex))
     p = _p_two_sided(u1, tie_term, m, n_ref)
     return u1, p
 
 
 def mwu_one_group_lfc(
     sorted_ref: torch.Tensor,    # (n_genes, n_ref) float32, sorted along dim=1
-    ref_tie_term: torch.Tensor,  # (n_genes,) float64 -- the UNSHIFTED term
+    ref_tie_term: torch.Tensor,  # (n_genes,) int64 or float64; UNSHIFTED
     group_T: torch.Tensor,       # (n_genes, m) float32
     n_ref: int,
     *,
@@ -433,8 +554,10 @@ def mwu_one_group_lfc(
     # --- base two-sided test: byte-identical to mwu_one_group ---------------
     u1 = _u1_against(sorted_ref, group_T)
     group_sorted, gc, run_start = _sorted_and_selfties(group_T)
-    tie_term = ref_tie_term + _cross_tie_delta(sorted_ref, group_sorted, gc,
-                                               run_start)
+    _ex = _tie_exact(ref_tie_term, m, n_ref)
+    tie_term = _pool_tie(ref_tie_term,
+                         _cross_tie_delta(sorted_ref, group_sorted, gc,
+                                          run_start, exact=_ex))
     p = _p_two_sided(u1, tie_term, m, n_ref)
 
     # --- hoisted once for the whole grid (spec 3.2b) ------------------------
@@ -461,8 +584,9 @@ def mwu_one_group_lfc(
         # NEVER re-sort. LOAD-BEARING: 0 * s == 0, so the zero-tie mass
         # survives; the CROSS delta must be recomputed against the scaled
         # target (spec 3.4b). It is the only per-combo tie work.
-        tie_s = ref_tie_term + _cross_tie_delta(sorted_ref, gs64 * s, gc,
-                                                run_start)
+        tie_s = _pool_tie(ref_tie_term,
+                          _cross_tie_delta(sorted_ref, gs64 * s, gc,
+                                           run_start, exact=_ex))
         stat = u1_s if direction == "up" else (mn - u1_s)
         dir_u1[k] = u1_s
         dir_p[k] = _p_one_sided(stat, tie_s, m, n_ref)
@@ -508,7 +632,7 @@ def _taustar_root(sorted_ref, gT64, lo0, hi0, up_mask, z_q, sigma, mu,
 
 def mwu_one_group_taustar(
     sorted_ref: torch.Tensor,    # (n_genes, n_ref) float32, sorted along dim=1
-    ref_tie_term: torch.Tensor,  # (n_genes,) float64 -- the UNSHIFTED term
+    ref_tie_term: torch.Tensor,  # (n_genes,) int64 or float64; UNSHIFTED
     group_T: torch.Tensor,       # (n_genes, m) float32
     n_ref: int,
     *,
@@ -567,14 +691,17 @@ def mwu_one_group_taustar(
     # --- base two-sided test: byte-identical to mwu_one_group ---------------
     u1 = _u1_against(sorted_ref, group_T)
     group_sorted, gc, run_start = _sorted_and_selfties(group_T)
-    tie_term = ref_tie_term + _cross_tie_delta(sorted_ref, group_sorted, gc,
-                                               run_start)
+    _ex = _tie_exact(ref_tie_term, m, n_ref)
+    tie_term = _pool_tie(ref_tie_term,
+                         _cross_tie_delta(sorted_ref, group_sorted, gc,
+                                          run_start, exact=_ex))
     p = _p_two_sided(u1, tie_term, m, n_ref)
 
     # --- hoisted once for the whole level set (spec 3.4) --------------------
     n0, m0 = _zero_counts(sorted_ref, group_sorted)
-    tie_generic = ref_tie_term + _cross_tie_generic(group_sorted, gc,
-                                                    run_start, n0)
+    tie_generic = _pool_tie(ref_tie_term,
+                            _cross_tie_generic(group_sorted, gc, run_start,
+                                               n0, exact=_ex))
     sigma = torch.sqrt(_s_sq_of(tie_generic, m, n_ref))
     u1_min, u1_max = _u1_reach_limits(m, m0, n_ref, n0)
 
