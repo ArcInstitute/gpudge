@@ -7,6 +7,7 @@ import numpy as np
 
 from ._ingest import reject_missing_group_labels
 from ._csr_dense import csr_row_sums
+from ._stream_backend import validate_archive_reference
 
 logger = logging.getLogger(__name__)
 
@@ -242,14 +243,8 @@ class _CellBackend:
                 "reference=<AnnData>, or re-write the archive with "
                 "shardad.write_sharded(..., reference=<label(s)>)."
             )
-        if reference is not None and str(reference) not in set(labels):
-            raise ValueError(
-                f"reference={reference!r} is not among the archive's reference "
-                f"labels {sorted(labels)}."
-            )
+        msg_label = validate_archive_reference(reference, labels)
         ref_X = self._gather(0, self._ref_stop)
-        msg_label = (str(reference) if reference is not None
-                     else "|".join(sorted(labels)))
         return ref_X, msg_label
 
     def targets(self):

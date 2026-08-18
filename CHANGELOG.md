@@ -107,6 +107,140 @@ H100, and 3 were refuted and are not listed here).
   every magnitude. Third occurrence of this trap in the repo. All of them pass
   exactly on an H100, so the paths were identical — only the gates were blind.
 
+Five more from the same review's LOW tier (verified but unfixed at the time),
+plus the test-quality gaps that let them through. All degenerate-input or
+diagnostic fixes — **no change to any computed value on a well-formed input**,
+measured rather than asserted: 13 `de()` configurations (base; cpm; median;
+epsilon=0 arithmetic and geometric; ALL_OTHERS ±cpm; the four-filter set; an lfc
+grid; a tau* grid with SE; a pinned chunk size; and both external-reference
+modes ±cpm) hash byte-for-byte identically against `main` on an H100.
+
+- **`cpm_normalize` must now be a real boolean.** It was tested for bare
+  truthiness, so `cpm_normalize='false'` (or `'False'`, `'no'`, `'0'`, or any
+  non-zero number) silently turned CPM normalization ON — byte-identical to
+  `cpm_normalize=True` and materially different from the `False` it reads as
+  (measured on a 300×40 fixture: `max|Δ log2FC| = 0.105`, `max|Δ p| = 0.275`
+  against the real `False`). Now raises, in both directions, matching the
+  existing `tau_star_se` guard verbatim — including its rationale, that
+  `tau_star_se='false'` would otherwise mean True. Validated in `de()`'s
+  fail-fast block (above the CUDA probe, so a typo costs nothing) and again in
+  the shared `resolve_target_sum`, which direct callers reach without passing
+  through `de()`.
+- **A reference-only input returns the typed empty frame** instead of running
+  the whole GPU pass and then dying on
+  `IndexError: arrays used as indices must be of integer (or boolean) type`.
+  `ingest` permits a single group that IS the reference — it checks the groupby
+  column, NaN labels and reference membership, not "at least one target" — and
+  the untyped `np.array([])` the post-loop assembly built is float64. The index
+  array now carries `dtype=np.intp`, and the tail then produces a frame
+  schema-identical to `empty_output_frame()`, `lfc` and `tau*` extras included
+  (measured, not assumed). All four target-enumeration paths answer this
+  degenerate object the same way. `de(cell_source=..., targets=[])` still
+  raises — an explicitly empty target list is a caller error, not a degenerate
+  object. The full GPU pass still runs for such an input: an early return was
+  written and then dropped, because it diverged `densify_input`'s documented
+  in-place contract and bypassed late parameter validation, for a saving nobody
+  collects on a degenerate object (codex review).
+- **A zero-gene `adata` returns the typed empty frame** instead of
+  `ValueError: initial_chunk must be > 0, got 0`, which named an internal
+  parameter the caller never passed. Both auto chunk sizers are floored at 1;
+  the floor is reachable only at `n_genes == 0`, since both produce >= 16 before
+  the `min(chunk, n_genes)` clamp. The same input WITH a pinned
+  `gpu_gene_chunk_size` already returned a correct 0-row frame, so this makes
+  the auto path agree with the pinned one it contradicted. Fixes the
+  literal-reference, in-memory external-reference and `ALL_OTHERS` paths at once.
+- **The documented `epsilon=0` path is silent.** It is a supported input whose
+  NaN / ±inf outcomes the `de()` docstring and README both promise, but the
+  divide emitted three unsuppressed numpy RuntimeWarnings and *raised* under
+  `-W error::RuntimeWarning` (which took four of the repo's own tests with it).
+  Both log2FC sites now go through a shared `_output.log2_ratio`, whose
+  suppression is **conditional**: it applies only when `epsilon == 0` and both
+  means are finite and non-negative. Each clause earns its place, and the
+  blanket `np.errstate` this change first used *would have* hidden all three —
+  gpudge accepts arbitrary X, so a centered or
+  log-transformed input can carry a negative mean, a pathological one an
+  infinite mean (`inf/inf`), and even with a positive epsilon the *quotient* can
+  underflow to zero and make `log2(0)` warn. Three rounds of codex review; the
+  underflow case in particular refuted the reasoning that had the `epsilon`
+  clause down as a mere fast path. It is that too: the default `epsilon=1e-9`
+  now pays no scan at all (~87 ms at CCL_2 shape).
+- **`de(archive=..., reference=...)` validates against the whole pool.** Both
+  backends gather the archive's reference pool WHOLE, so `reference=` can only
+  NAME it, never subset it, and two inputs went wrong. A sequence was
+  stringified by the membership test, so a list that exactly matched the
+  archive's labels produced the self-contradictory `reference=['ntc', 'safe'] is
+  not among the archive's reference labels ['ntc', 'safe']`; it is now accepted.
+  Naming ONE label of a multi-label pool stays legal and still uses the pool
+  whole — that is specified ("`reference=<label>` is validated for membership in
+  the reference labels and otherwise does not subset", 2026-07-31 cell-layout
+  design), and a round of this change that "fixed" it was reverted. Shared
+  between both layouts as `_stream_backend.validate_archive_reference`.
+  `reference=None` is unaffected; a `np.str_` no longer leaks into the reported
+  label, a 0-d `np.array('ntc')` no longer raises `TypeError` on iteration,
+  numpy byte-string elements decode like a scalar `bytes`, a generator is
+  materialized before being read twice, and an empty sequence gets its own
+  message.
+
+- **`gpu_gene_chunk_size` is validated at entry.** It was unchecked, so a `0`
+  or a negative reached `run_gene_chunks_with_recovery` and raised
+  `initial_chunk must be > 0` — an internal parameter name no caller passes.
+  Now a clear `ValueError` naming the public parameter, before any GPU work.
+  `True` is rejected explicitly (`bool` is an `Integral`).
+
+### Tests
+
+Six release-gate tests could not fail, or could not fail at the magnitude that
+matters. Each fix below was verified by breaking the code it guards and watching
+it go red.
+
+- **`test_cpm_normalize_matches_external`'s p-value assertion no longer
+  vanishes.** It sat inside `if finite.sum() > 10:`, so the test PASSED with
+  all-NaN p-values, all-inf p-values, ten finite anti-correlated values, and a
+  0-row frame. Now `assert`, matching the two siblings 50 lines down in the same
+  file that already used the unconditional form.
+- **`test_zero_denominator_cpm_bulk_all_others_empty_rest` asserts something.**
+  Its whole body was `assert out is not None`, and `de()` has no `return None`
+  on any path. The zero-library-total guards it exists to protect are
+  *provably* invisible to the keep mask — a guarded 0 and an unguarded NaN
+  compare identically under `_one_filter_mask`'s strict `>` for every threshold
+  >= 0, and a threshold < 0 short-circuits to all-True — so what is pinned is
+  the absence of the 0/0 RuntimeWarning, plus the frame's real contents. Four
+  **CPU-runnable** pins for the same two guards were added to
+  `tests/test_filter.py`; CPU CI covered none of this before.
+- **The documented `epsilon=0` degenerate log2FC is pinned.** README and the
+  `de()` docstring both promise NaN for a both-zero gene and ±inf for a
+  one-sided one, "matching pdex". Nothing asserted it: replacing the whole
+  contract with `0`/`±30` left the entire suite green when the review measured
+  it (737 cases at that commit).
+- **`group_means` is validated on CPU.** Its only oracle tests were `@needs_cuda`
+  with a hard-coded `.cuda()` though the function is device-agnostic, so CPU CI
+  validated no part of `target_mean` / `ref_mean` / `log2_fold_change`. Now
+  parametrized over both devices, with an empty-group case and **float64**
+  oracles — reducing the oracle in float32, as it did, made a
+  float32-accumulation regression invisible on every device. All four mutations
+  (segment reduction, mean division, empty-group guard, float32 accumulation)
+  now fail on CPU.
+- **The normalization non-mutation contract is asserted.** `de()` documents in
+  four places that `cpm_normalize` / `normalize_target_sum` do not touch the
+  caller's `X` — unlike `densify_input` and the CSC→CSR coercion, which say the
+  opposite and each have an explicit assertion. The one variant with no indirect
+  detector anywhere is the classic literal-reference in-memory path, which is
+  what the new test covers.
+- **Oracle tolerances brought within range of the measured agreement.** The
+  end-to-end scipy p-value check used a `1e-3` ABSOLUTE bound (~4 orders looser
+  than the measured 6e-8 / 4e-7 residual, and enough to hide a z-shift of order
+  1e-3 at p~0.5) on 5 sampled rows of 250 — now all 250 rows at
+  `rtol=1e-5, atol=1e-7`. `test_mwu.py`'s U check allowed `atol=0.5`, exactly
+  one U lattice step and therefore the smallest representable U regression,
+  against a measured agreement of 0.0 — now `1e-6`; its p check moved from
+  `rtol=1e-3` (inside 15% of the 1.15e-3 a tie-divisor regression produces) to
+  `1e-5`. The real-data CPU-pdex baseline rested on Pearson `r > 0.999` alone,
+  which is exactly invariant to any affine transform: a log2FC max-abs
+  difference of 1.351 passed, as did losing 99.9% of the joined rows. It now
+  asserts join coverage in both directions and absolute value bounds
+  (log2FC 1e-3, p_value 1e-9, both >= 10x the measured 5.2e-5 / 1.6e-15 on
+  22,049 rows of CCL_1 chunk_0000).
+
 ## [0.7.0] — 2026-08-02
 
 ### Added

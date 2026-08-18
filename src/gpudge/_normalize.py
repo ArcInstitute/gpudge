@@ -11,6 +11,40 @@ import numpy as np
 _MEDIAN = "median"
 
 
+def normalize_cpm_flag(cpm_normalize) -> bool:
+    """Return ``cpm_normalize`` as a strict ``bool``, or raise.
+
+    Truthy coercion is refused outright, exactly as for ``tau_star_se``:
+    ``cpm_normalize='false'`` (or ``'False'``, or ``'no'``) would otherwise mean
+    True and silently CPM-normalize -- byte-identical to ``cpm_normalize=True``
+    and materially different from the ``False`` the caller wrote. Every non-empty
+    string and every non-zero number was accepted before this guard.
+
+    A 0-d numpy/torch boolean scalar is accepted (``de()`` already takes numpy
+    scalars elsewhere); a numeric one is not. ``ndim == 0`` is REQUIRED, not
+    decorative: ``.item()`` unwraps a one-element vector too, so
+    ``np.array([True])`` would otherwise pass as a scalar.
+    """
+    if cpm_normalize is True:
+        return True
+    if cpm_normalize is False:
+        return False
+    if getattr(cpm_normalize, "ndim", None) == 0:
+        try:
+            value = cpm_normalize.item()
+        except (TypeError, ValueError, AttributeError):
+            value = None
+        if value is True:
+            return True
+        if value is False:
+            return False
+    raise ValueError(
+        f"cpm_normalize must be True or False; got {cpm_normalize!r}. Truthy "
+        f"values are rejected deliberately -- cpm_normalize='false' would "
+        f"otherwise mean True. A numpy/torch boolean scalar is accepted; a "
+        f"numeric one is not.")
+
+
 def resolve_target_sum(*, cpm_normalize, normalize_target_sum, row_sums):
     """Return the resolved per-cell normalization target as a float, or None
     for "no normalization".
@@ -39,6 +73,7 @@ def resolve_target_sum(*, cpm_normalize, normalize_target_sum, row_sums):
     **no scanpy release carries it as of 1.12.3**. Pinned by
     ``tests/test_scanpy_median_contract.py``.
     """
+    cpm_normalize = normalize_cpm_flag(cpm_normalize)
     if cpm_normalize and normalize_target_sum is not None:
         raise ValueError(
             "only one of cpm_normalize / normalize_target_sum may be set "

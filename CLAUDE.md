@@ -86,12 +86,13 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
   `test_cell_stream.py`, `test_inmem_external_ref_gpu.py` — each a module-level
   `pytest.importorskip("shardad")`) are not collected at all.
 
-  Counts, measured 2026-08-18 — do not propagate them without re-measuring. This
-  tree with **no** GPU reports **537 passed / 188 skipped** (725 collected), and
-  its CI reports **469 passed / 120 skipped** — 116 CUDA-gated cases, the 3
+  Counts, measured 2026-08-18 — do not propagate them without re-measuring;
+  two upstream changes moved every figure here within one day. This tree with
+  **no** GPU reports **615 passed / 200 skipped** (815 collected), and its CI
+  reports **545 passed / 132 skipped** — 128 CUDA-gated cases, the 3
   module-level shardad skips, and the one real-data test. The three shardad
-  suites hold **139 cases,
-  68 of which need no GPU at all** (33 + 35 + 0 pass on a GPU-less host), so what
+  suites hold **141 cases,
+  70 of which need no GPU at all** (33 + 37 + 0 pass on a GPU-less host), so what
   CI misses there is not only GPU coverage. A GPU run has to hard-fail when torch
   cannot see a GPU, or when shardad/numba are absent — otherwise those tests
   silently skip, pytest exits 0, and the result is a green gate that tested

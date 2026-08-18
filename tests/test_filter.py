@@ -1,4 +1,6 @@
 # tests/test_filter.py
+import warnings
+
 import numpy as np
 import pytest
 from gpudge._filter import (
@@ -198,3 +200,54 @@ def test_x_has_noncount_signal_never_copies_a_dense_matrix(monkeypatch):
     for name, Y in frac.items():
         Y[1, 1] = -3.0
         assert _filter.x_has_noncount_signal(Y) is True, name
+
+
+# --- 2026-08 ultrareview (lows): the ALL_OTHERS zero-library-total guards ----
+#
+# `_all_others_chunk_keep` guards BOTH cpm-bulk denominators
+# (`libtot_safe`, `rest_libtot_safe`). Their only observable effect is the
+# absence of a 0/0 RuntimeWarning: a group with zero library total also has
+# zero counts, so the guarded quantity is 0 where the unguarded one is NaN --
+# and `_one_filter_mask` uses a strict `>`, under which 0 and NaN compare
+# identically against every threshold >= 0 while a threshold < 0 short-circuits
+# to all-True. So the keep MASK cannot distinguish them on any input, which is
+# why the (GPU-gated) integration test in test_review_coverage.py pins the
+# warning rather than a value. This is the CPU-runnable half of that pin.
+
+def _bulk_keep_with_empty_rest(threshold):
+    from gpudge import _all_others_chunk_keep
+    ch = 6
+    arith = np.array([[1.0, 2.0, 0.0, 3.0, 4.0, 5.0]])   # ONE group = everyone
+    return _all_others_chunk_keep(
+        0, ch, ch, arith, None,
+        np.array([40.0]),          # counts
+        np.array([1.0]),           # rest_count_safe (already guarded upstream)
+        np.array([600.0]),         # group_libtot -> rest_libtot == 0
+        None, None, None, None, threshold, None)
+
+
+@pytest.mark.parametrize("threshold", [0.0, 1.0, 1e5])
+def test_all_others_bulk_keep_survives_empty_rest(threshold):
+    """rest_libtot == 0 must not divide by zero."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        keep = _bulk_keep_with_empty_rest(threshold)
+    assert keep.shape == (1, 6)
+    assert keep.dtype == bool
+
+
+def test_all_others_bulk_keep_survives_a_zero_library_group():
+    """The twin guard: group_libtot == 0 is the TARGET denominator."""
+    from gpudge import _all_others_chunk_keep
+    ch = 4
+    arith = np.array([[0.0, 0.0, 0.0, 0.0],      # g0 contributes nothing
+                      [1.0, 2.0, 3.0, 4.0]])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        keep = _all_others_chunk_keep(
+            0, ch, ch, arith, None,
+            np.array([10.0, 30.0]),              # counts
+            np.array([30.0, 10.0]),              # rest_count_safe
+            np.array([0.0, 300.0]),              # group_libtot: g0 is empty
+            None, None, None, None, 1.0, None)
+    assert keep.shape == (2, 4)

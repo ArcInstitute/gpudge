@@ -21,6 +21,7 @@ from ._mwu import (
 )
 from ._output import DEFAULT_OUTPUT_COLUMNS
 from ._stream import run_gene_chunks_with_recovery
+from ._stream_backend import validate_archive_reference
 from ._taustar import taustar_column_names
 
 logger = logging.getLogger(__name__)
@@ -243,13 +244,7 @@ class _ShardBackend:
                 f"without unassigned reference cells. (mirrors the _ingest guard)"
             )
         ref_label_set = set(np.asarray(ref_col).astype(str).tolist())
-        if reference is not None and str(reference) not in ref_label_set:
-            raise ValueError(
-                f"reference={reference!r} is not among the archive's reference "
-                f"labels {sorted(ref_label_set)}."
-            )
-        msg_label = (str(reference) if reference is not None
-                     else "|".join(sorted(ref_label_set)))
+        msg_label = validate_archive_reference(reference, ref_label_set)
         return ref_adata.X, msg_label
 
     def targets(self):

@@ -424,3 +424,117 @@ def test_driver_does_not_catch_oom_type_absent_from_tuple(monkeypatch):
     with pytest.raises(_FakeCupyOOM):
         run_gene_chunks_with_recovery(50, 20, process,
                                       oom_recovery=True, floor=1)
+
+
+# --- 2026-08 ultrareview (lows): degenerate-shape handling -------------------
+
+def test_auto_gene_chunk_size_floors_at_one_for_zero_genes():
+    """A zero-gene input must not drive the sizer to 0.
+
+    `run_gene_chunks_with_recovery` rejects `initial_chunk <= 0` with a message
+    naming an internal parameter the caller never passed, so `de()` on a
+    0-var AnnData died there instead of returning the typed empty frame it
+    already returns when `gpu_gene_chunk_size` is pinned.
+    """
+    for ref_mode in (True, False):
+        assert _auto_gene_chunk_size(
+            free_bytes=39 * 1024**3, budget_n=1000, n_groups=3,
+            mean_calc="arithmetic", n_genes=0, ref_mode=ref_mode) == 1
+
+
+def test_auto_gene_chunk_size_inmem_floors_at_one_for_zero_genes():
+    from gpudge._refpool import _auto_gene_chunk_size_inmem
+    assert _auto_gene_chunk_size_inmem(
+        free_bytes=39 * 1024**3, n_ref=1000, n_genes=0,
+        max_group_rows=500) == 1
+
+
+def test_zero_genes_drives_zero_chunks_without_raising():
+    """The floor is only useful if the driver then no-ops. Pins the pairing."""
+    seen = []
+    run_gene_chunks_with_recovery(0, 1, lambda s, e: seen.append((s, e)))
+    assert seen == []
+
+
+# --- 2026-08 ultrareview (lows): archive reference= validation --------------
+#
+# Both backends gather the archive's reference pool WHOLE, so `reference=` can
+# only NAME it, never subset it. Two inputs went wrong before
+# `validate_archive_reference`: a list was stringified into a
+# self-contradictory "not among ... labels" message. Naming ONE label of a
+# multi-label pool is specified to be legal and still use the whole pool, so
+# that is pinned here too rather than "fixed".
+
+def test_validate_archive_reference_none_reports_the_whole_pool():
+    from gpudge._stream_backend import validate_archive_reference
+    assert validate_archive_reference(None, {"safe", "ntc"}) == "ntc|safe"
+
+
+def test_validate_archive_reference_accepts_the_sole_label():
+    from gpudge._stream_backend import validate_archive_reference
+    assert validate_archive_reference("ntc", {"ntc"}) == "ntc"
+
+
+def test_validate_archive_reference_accepts_a_list_naming_the_whole_pool():
+    """The self-contradictory message: `reference=['ntc','safe'] is not among
+    the archive's reference labels ['ntc','safe']`."""
+    from gpudge._stream_backend import validate_archive_reference
+    assert validate_archive_reference(["safe", "ntc"],
+                                      {"ntc", "safe"}) == "ntc|safe"
+
+
+@pytest.mark.parametrize("subset,want", [("ntc", "ntc"), (["ntc"], "ntc"),
+                                         ("safe", "safe"), (("safe",), "safe")])
+def test_validate_archive_reference_accepts_a_partial_pool(subset, want):
+    """SPECIFIED behaviour, not an oversight: "reference=<label> is validated
+    for membership in the reference labels and otherwise does not subset -- the
+    pool is all reference rows" (2026-07-31 cell-layout design). Pinned so the
+    membership-only contract is not "tightened" by a future reader (I tried).
+    The EXACT label is asserted -- `in ("ntc", "safe")` would pass if the wrong
+    known label came back."""
+    from gpudge._stream_backend import validate_archive_reference
+    assert validate_archive_reference(subset, {"ntc", "safe"}) == want
+
+
+@pytest.mark.parametrize("bad", ["nope", ["ntc", "nope"], ["nope"]])
+def test_validate_archive_reference_rejects_an_unknown_label(bad):
+    from gpudge._stream_backend import validate_archive_reference
+    with pytest.raises(ValueError, match="is not among the archive"):
+        validate_archive_reference(bad, {"ntc", "safe"})
+
+
+def test_validate_archive_reference_does_not_iterate_a_string():
+    """'ntc' must not decompose into {'n','t','c'} — str is a Sequence."""
+    from gpudge._stream_backend import validate_archive_reference
+    with pytest.raises(ValueError, match="is not among the archive"):
+        validate_archive_reference("ntc", {"n", "t", "c"})
+
+
+@pytest.mark.parametrize("ref", [
+    "ntc",                                       # plain str
+    b"ntc",                                      # bytes
+    bytearray(b"ntc"),
+    np.str_("ntc"),                              # str subclass -- must not leak
+    np.array("ntc"),                             # 0-d: Iterable, but un-iterable
+    np.array(b"ntc"),                            # 0-d bytes -> "np.bytes_(...)"
+])
+def test_validate_archive_reference_returns_a_plain_str_label(ref):
+    from gpudge._stream_backend import validate_archive_reference
+    got = validate_archive_reference(ref, {"ntc"})
+    assert got == "ntc"
+    assert type(got) is str
+
+
+def test_validate_archive_reference_consumes_a_generator_once():
+    """`reference` is read twice (membership, then the message), so it has to
+    be materialized -- a generator would otherwise validate as empty."""
+    from gpudge._stream_backend import validate_archive_reference
+    gen = (x for x in ["safe", "ntc"])
+    assert validate_archive_reference(gen, {"ntc", "safe"}) == "ntc|safe"
+
+
+def test_validate_archive_reference_rejects_an_empty_sequence():
+    """`[]` names NONE of the pool, not "part" of it."""
+    from gpudge._stream_backend import validate_archive_reference
+    with pytest.raises(ValueError, match="is an empty sequence"):
+        validate_archive_reference([], {"ntc", "safe"})

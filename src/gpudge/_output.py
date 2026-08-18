@@ -2,6 +2,8 @@
 """Assemble the per-(target, feature) DataFrame with optional rename/select."""
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 import polars as pl
 
@@ -51,6 +53,65 @@ def effect_size_from_u(u, target_ncells, ref_ncells):
     with np.errstate(divide="ignore", invalid="ignore"):
         eff = 2.0 * u / denom - 1.0
     return np.where(denom > 0, eff, np.nan)
+
+
+def log2_ratio(target_mean, ref_mean, epsilon: float) -> np.ndarray:
+    """``log2((target_mean + epsilon) / (ref_mean + epsilon))``, silencing only
+    the DOCUMENTED degeneracies.
+
+    ``epsilon=0`` is a supported input whose outcomes ``de()`` promises: a gene
+    zero in both groups yields NaN, a one-sided gene ±inf. Producing a
+    documented value must not also emit an unsuppressed numpy RuntimeWarning --
+    which under ``-W error::RuntimeWarning`` turns the documented path into a
+    crash, and took four of this repo's own tests with it.
+
+    The suppression is CONDITIONAL, and that is the point. It applies only when
+    ``epsilon == 0`` -- the only setting under which the documented degeneracies
+    arise -- AND both means are finite and non-negative.
+
+    That predicate is a DOMAIN GUARD, not a proof of completeness, and one gap
+    is known: with ``epsilon == 0`` and two strictly positive finite means whose
+    quotient UNDERFLOWS (``float64.tiny / float64.max``), ``log2(0)`` warns and
+    this helper silences it even though neither mean is zero. Unreachable from
+    ``de()`` -- its float64 means come from float32-staged data, and dividing by
+    even the largest possible cell count leaves float64 range to spare -- so it
+    is documented rather than closed. Do not restate this function as
+    "silences only the documented cases" without closing it. (codex review.)
+
+    gpudge accepts arbitrary X, so the clauses each earn their place:
+
+    * a centered or log-transformed input can carry a NEGATIVE mean, and
+      ``log2`` of a negative ratio is undefined rather than documented;
+    * an INFINITE mean gives ``inf/inf`` → NaN, equally undefined, and ``inf``
+      would otherwise pass a bare non-negativity test (codex review);
+    * a NaN mean makes both reductions NaN, and every comparison against NaN is
+      False, so it keeps its diagnostics too.
+
+    The ``epsilon`` test is not merely a fast path, though it is that too (the
+    default ``epsilon=1e-9`` pays no scan, ~87 ms at CCL_2 shape). It is load
+    bearing: with a positive epsilon the DENOMINATOR is ``>= epsilon``, but the
+    QUOTIENT can still reach zero by underflow -- ``1e-300 / 3.4e38`` is 0.0,
+    and ``log2(0)`` warns -- so suppressing on a positive epsilon would hide a
+    real diagnostic. Pass the UNBROADCAST arrays: ``ref_mean`` is ``(n_genes,)``
+    on the literal-reference path, and scanning the broadcast view instead would
+    cost a full ``(n_groups, n_genes)`` pass.
+    """
+    tm = np.asarray(target_mean)
+    rm = np.asarray(ref_mean)
+    # `+ 0.0` normalizes a signed zero: `epsilon=-0.0` passes de()'s
+    # `isfinite and >= 0` validation, and `x / (-0.0 + -0.0)` is -inf where the
+    # docstring promises +inf for a target-only gene.
+    epsilon = epsilon + 0.0
+    documented_only = epsilon == 0 and (
+        tm.size == 0 or rm.size == 0
+        # min() >= 0 excludes negatives and -inf; isfinite(max()) excludes
+        # +inf. NaN fails both, which is the intent.
+        or (tm.min() >= 0 and rm.min() >= 0
+            and np.isfinite(tm.max()) and np.isfinite(rm.max())))
+    ctx = (np.errstate(divide="ignore", invalid="ignore") if documented_only
+           else contextlib.nullcontext())
+    with ctx:
+        return np.log2((tm + epsilon) / (rm + epsilon))
 
 
 def empty_output_frame(output_columns: dict[str, str] | None = None,

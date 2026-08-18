@@ -613,3 +613,58 @@ def test_cell_stream_batch_size_invariance(cell_mode1, monkeypatch):
 
     assert n_tiny > n_huge == 1, f"batch plan did not change: {n_tiny} vs {n_huge}"
     _assert_exact(tiny, huge)
+
+
+# --- 2026-08 ultrareview (lows): multi-label reference pool ------------------
+
+@pytest.fixture
+def cell_multiref(tmp_path):
+    """Cell archive whose reference pool spans TWO labels (ntc + safe)."""
+    adata = _make_synth(n_cells=600, n_genes=40, n_guides=8, sparse=True, seed=1)
+    comp = adata.obs["comparison"].to_numpy().astype(str)
+    # Re-label one target group as a second control so the pool has 2 labels.
+    # Via a python list, NOT in place: the array is fixed-width ('<U3' here),
+    # so `comp[mask] = "safe"` silently truncates to 'saf'.
+    second = sorted(set(comp) - {"ntc"})[0]
+    adata.obs["comparison"] = np.array(
+        ["safe" if c == second else c for c in comp], dtype=object).astype(str)
+    p = _write_cell(adata, tmp_path / "multiref.csad",
+                    group_by="comparison", reference=["ntc", "safe"])
+    return p, adata
+
+
+def test_cell_backend_accepts_a_list_naming_the_whole_pool(cell_multiref):
+    """`reference=['ntc','safe']` used to produce the self-contradictory
+    `... is not among the archive's reference labels ['ntc','safe']`."""
+    from gpudge._stream_backend import open_backend
+    p, adata = cell_multiref
+    b = open_backend(p, n_workers=2, prefetch=0)
+    try:
+        ref_X, msg = b.resolve_archive_reference("comparison", ["ntc", "safe"])
+        comp = adata.obs["comparison"].to_numpy().astype(str)
+        n_ref = int(((comp == "ntc") | (comp == "safe")).sum())
+        assert ref_X.shape == (n_ref, adata.n_vars)
+        assert msg == "ntc|safe"
+        # ... and it must be the same pool reference=None resolves to.
+        ref_none, msg_none = b.resolve_archive_reference("comparison", None)
+        assert msg_none == msg
+        np.testing.assert_array_equal(ref_X.toarray(), ref_none.toarray())
+    finally:
+        b.close()
+
+
+def test_cell_backend_accepts_one_label_of_a_multi_label_pool(cell_multiref):
+    """Specified: membership-only validation, pool used whole. Pinned so the
+    contract is visible at the backend level, not just in the pure helper."""
+    from gpudge._stream_backend import open_backend
+    p, adata = cell_multiref
+    b = open_backend(p, n_workers=2, prefetch=0)
+    try:
+        ref_none, _ = b.resolve_archive_reference("comparison", None)
+        for partial, want in (("ntc", "ntc"), (["safe"], "safe")):
+            ref_X, msg = b.resolve_archive_reference("comparison", partial)
+            # ... and it really is the WHOLE pool, not the named label's rows.
+            np.testing.assert_array_equal(ref_X.toarray(), ref_none.toarray())
+            assert msg == want
+    finally:
+        b.close()

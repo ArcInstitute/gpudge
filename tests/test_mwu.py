@@ -48,9 +48,14 @@ def _assert_mwu_ref_matches_scipy(device):
 
     # ref row is zeros/ones; ignore it
     mask = np.arange(n_groups) != ref_idx
-    np.testing.assert_allclose(U_got[mask], U_exp[mask], rtol=0, atol=0.5)
-    # p-values: relative agreement to ~1% (Normal approximation, ties)
-    np.testing.assert_allclose(p_got[mask], p_exp[mask], rtol=1e-3, atol=1e-6)
+    # atol=0.5 was exactly ONE U lattice step -- the smallest representable U
+    # regression -- against a measured agreement of 0.0. 1e-6 still absorbs any
+    # float noise while leaving no room for a half-pair error.
+    np.testing.assert_allclose(U_got[mask], U_exp[mask], rtol=0, atol=1e-6)
+    # p: measured 2.5e-7 relative / 5.3e-8 absolute against scipy. rtol=1e-3
+    # was marginal for the regression class it exists to catch -- a tie/(N*N)
+    # divisor error lands at 1.15e-3, inside 15% of the old bar.
+    np.testing.assert_allclose(p_got[mask], p_exp[mask], rtol=1e-5, atol=1e-9)
 
 
 def test_mwu_ref_matches_scipy_cpu():

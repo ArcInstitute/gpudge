@@ -27,14 +27,30 @@ def test_de_end_to_end_matches_scipy_ground_truth(synth_small):
     X = np.asarray(synth_small.X)
     labels = synth_small.obs["comparison"].to_numpy()
     ref_X = X[labels == "ntc"]
-    # Spot-check 5 random (guide, gene) pairs
-    rows = result.sample(n=5, seed=0).to_dicts()
-    for r in rows:
+    # The full Cartesian key set, asserted: without this a missing or duplicated
+    # gene passes, because the loop only ever checks the rows that ARE there.
+    expected_keys = {(t, f) for t in target_groups
+                     for f in synth_small.var_names}
+    got_keys = set(zip(result["target"].to_list(), result["feature"].to_list()))
+    assert got_keys == expected_keys
+    assert len(got_keys) == result.height          # no duplicate rows
+    # EVERY (guide, gene) pair, not 5 sampled ones: scipy on a 250-row fixture
+    # costs milliseconds, and sampling left 98% of the oracle unused.
+    got, want = [], []
+    for r in result.to_dicts():
         gX = X[labels == r["target"]]
         j = int(synth_small.var_names.get_loc(r["feature"]))
         sp_res = mannwhitneyu(gX[:, j], ref_X[:, j],
                               alternative="two-sided", method="asymptotic")
-        assert abs(r["p_value"] - sp_res.pvalue) < 1e-3
+        got.append(r["p_value"])
+        want.append(sp_res.pvalue)
+    # A 1e-3 ABSOLUTE bound was ~4 orders looser than the residual the 2026-08
+    # review measured here (6e-8 abs / 4e-7 rel) and would have tolerated a
+    # z-shift of order 1e-3 at p~0.5. Relative now, with atol kept in the
+    # picture. NOT rtol=1e-6: that is only ~2.5x the measured relative residual,
+    # close enough to the float32 staging floor (gpudge_arc#115) to be a
+    # flakiness risk on another GPU generation. 1e-5 leaves ~25x.
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-7)
 
 
 @needs_cuda
@@ -822,3 +838,162 @@ def test_de_is_silent_on_the_tie_fallback(synth_small, monkeypatch):
     noisy = [r for r in rec if "gpu_gene_chunk_size" in str(r.message)
              or "tie-correction" in str(r.message)]
     assert not noisy, f"de() warned about the fallback: {[str(r.message) for r in noisy]}"
+
+
+# --- 2026-08 ultrareview (lows) ---------------------------------------------
+
+@pytest.mark.parametrize("bad", ["False", "false", "no", "0", 1, 0.5, None, 0])
+def test_de_rejects_non_bool_cpm_normalize(bad):
+    """`cpm_normalize='false'` was byte-identical to `cpm_normalize=True`.
+
+    CPU-runnable on purpose: the guard sits in de()'s fail-fast block, above
+    the CUDA probe, so a typo costs nothing.
+    """
+    with pytest.raises(ValueError, match="cpm_normalize must be True or False"):
+        de(_tiny_adata(), groupby="comparison", reference="ntc",
+           cpm_normalize=bad)
+
+
+@pytest.mark.parametrize("good", [True, False])
+def test_de_accepts_real_bool_cpm_normalize_past_the_guard(good, monkeypatch):
+    """The guard must not reject the two values that ARE legal. Asserts the
+    EXACT CUDA-unavailable error rather than suppressing RuntimeError, which
+    would have swallowed a guard regression and a GPU crash alike."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for value in (good, np.bool_(good)):
+        with pytest.raises(RuntimeError, match="gpudge requires a CUDA GPU"):
+            de(_tiny_adata(), groupby="comparison", reference="ntc",
+               cpm_normalize=value)
+
+
+@needs_cuda
+def test_de_reference_only_input_returns_the_typed_empty_frame():
+    """A reference-only object (the only group IS the reference) has nothing to
+    test. It used to run the WHOLE GPU pass and then die on
+    `IndexError: arrays used as indices must be of integer (or boolean) type`
+    from an untyped, and therefore float64, `np.array([])`."""
+    import anndata as ad
+    import scipy.sparse as sp
+    from gpudge._output import empty_output_frame
+    rng = np.random.default_rng(0)
+    X = rng.integers(0, 5, size=(40, 12)).astype(np.float32)
+    a = ad.AnnData(X=sp.csr_matrix(X), obs={"comparison": ["ntc"] * 40},
+                   var={"gene_id": [f"g{i}" for i in range(12)]})
+    out = de(a, groupby="comparison", reference="ntc")
+    assert out.height == 0
+    # Same schema as refpool_de_core's n_targets == 0 return, not merely "empty".
+    assert out.schema == empty_output_frame().schema
+
+
+@needs_cuda
+def test_de_reference_only_input_keeps_the_schema_with_extras():
+    """The zero-target return must carry the lfc/tau* columns too, or a caller
+    concatenating per-chunk frames gets a schema mismatch."""
+    import anndata as ad
+    import scipy.sparse as sp
+    rng = np.random.default_rng(0)
+    X = rng.integers(0, 5, size=(40, 12)).astype(np.float32)
+    a = ad.AnnData(X=sp.csr_matrix(X), obs={"comparison": ["ntc"] * 40},
+                   var={"gene_id": [f"g{i}" for i in range(12)]})
+    out = de(a, groupby="comparison", reference="ntc",
+             lfc_threshold=1.0, tau_star=0.5)
+    assert out.height == 0
+    populated = de(_synth_two_group(), groupby="comparison", reference="ntc",
+                   lfc_threshold=1.0, tau_star=0.5)
+    assert out.schema == populated.schema
+
+
+def _synth_two_group():
+    import anndata as ad
+    import scipy.sparse as sp
+    rng = np.random.default_rng(1)
+    X = rng.integers(0, 5, size=(40, 12)).astype(np.float32)
+    return ad.AnnData(X=sp.csr_matrix(X),
+                      obs={"comparison": ["ntc"] * 20 + ["g1"] * 20},
+                      var={"gene_id": [f"g{i}" for i in range(12)]})
+
+
+@needs_cuda
+def test_de_zero_gene_input_returns_the_typed_empty_frame():
+    """0-var AnnData: the auto sizer returned a 0 chunk and the driver raised
+    `initial_chunk must be > 0, got 0` — a parameter name the caller never
+    passed — while the SAME input with a pinned gpu_gene_chunk_size already
+    returned a correct 0-row frame."""
+    import anndata as ad
+    import scipy.sparse as sp
+    from gpudge._output import empty_output_frame
+    a = ad.AnnData(X=sp.csr_matrix((9, 0), dtype=np.float32),
+                   obs={"comparison": ["ntc"] * 3 + ["g1"] * 3 + ["g2"] * 3})
+    out = de(a, groupby="comparison", reference="ntc")
+    assert out.height == 0
+    assert out.schema == empty_output_frame().schema
+    # The auto path must now agree with the pinned one it used to contradict.
+    pinned = de(a, groupby="comparison", reference="ntc",
+                gpu_gene_chunk_size=256)
+    assert out.schema == pinned.schema
+
+
+@needs_cuda
+def test_de_epsilon_zero_emits_no_runtime_warning():
+    """epsilon=0 is documented to yield NaN / ±inf. Producing a DOCUMENTED
+    value must not also emit an unsuppressed numpy RuntimeWarning — which
+    under `-W error::RuntimeWarning` turned the documented path into a crash."""
+    import warnings
+    a = _epsilon_fixture()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        de(a, groupby="comparison", reference="ntc", epsilon=0.0)
+    runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert not runtime, [str(w.message) for w in runtime]
+
+
+@needs_cuda
+def test_de_epsilon_zero_raises_nothing_under_a_strict_filter():
+    """The consequence, pinned separately from the warning itself."""
+    import warnings
+    a = _epsilon_fixture()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        de(a, groupby="comparison", reference="ntc", epsilon=0.0)
+
+
+def _epsilon_fixture():
+    """g0 zero in both groups, g1 target-only, g2 reference-only, g3 normal."""
+    import anndata as ad
+    import scipy.sparse as sp
+    X = np.zeros((40, 4), dtype=np.float32)
+    X[:20, 1] = 3.0                      # target-only  -> ref_mean 0  -> +inf
+    X[20:, 2] = 3.0                      # ref-only     -> tgt_mean 0  -> -inf
+    X[:, 3] = np.arange(40, dtype=np.float32) % 5 + 1
+    a = ad.AnnData(X=sp.csr_matrix(X),
+                   obs={"comparison": ["g1"] * 20 + ["ntc"] * 20})
+    # var_names, NOT a `gene_id` COLUMN: `var={"gene_id": [...]}` leaves the
+    # index a RangeIndex, so `feature` comes back as "0".."3".
+    a.var_names = [f"g{i}" for i in range(4)]
+    return a
+
+
+@needs_cuda
+def test_de_epsilon_zero_pins_the_documented_degenerate_log2fc():
+    """README and the de() docstring both promise NaN for a both-zero gene and
+    ±inf for a one-sided one, "matching pdex". Nothing asserted it: replacing
+    the whole ±inf/NaN contract with 0/±30 left the ENTIRE suite green when the
+    2026-08 review measured it (737 cases at the time)."""
+    df = de(_epsilon_fixture(), groupby="comparison", reference="ntc",
+            epsilon=0.0).sort("feature")
+    lfc = dict(zip(df["feature"].to_list(),
+                   df["log2_fold_change"].to_numpy()))
+    assert np.isnan(lfc["g0"]), lfc          # zero in BOTH groups  -> NaN
+    assert lfc["g1"] == np.inf, lfc          # target-only          -> +inf
+    assert lfc["g2"] == -np.inf, lfc         # reference-only       -> -inf
+    assert np.isfinite(lfc["g3"]), lfc       # control
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, "256", True, False])
+def test_de_rejects_a_bad_gpu_gene_chunk_size(bad):
+    """It was unvalidated: a 0 reached `run_gene_chunks_with_recovery` and
+    raised `initial_chunk must be > 0, got 0` — an internal parameter name the
+    caller never passed. `True` is rejected explicitly (bool is an Integral)."""
+    with pytest.raises(ValueError, match="gpu_gene_chunk_size must be"):
+        de(_tiny_adata(), groupby="comparison", reference="ntc",
+           gpu_gene_chunk_size=bad)

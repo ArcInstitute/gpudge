@@ -10,7 +10,7 @@ name: CI
 #     tests/test_cell_stream.py, tests/test_inmem_external_ref_gpu.py) each
 #     carry a module-level `pytest.importorskip("shardad")`, so all three files
 #     skip entirely without the private `[streaming]` extra. Between them that
-#     is 139 cases, 68 of which need no GPU.
+#     is 141 cases, 70 of which need no GPU.
 #   - The real-data tests (tests/test_real_data.py) skip when the dataset path
 #     is absent (it always is on CI).
 # So this job goes green on a stock CPU runner with no GPU and without the

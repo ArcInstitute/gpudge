@@ -112,3 +112,42 @@ def test_row_scale_needs_none():
         median_requested=False)
     assert need_sums is False
     assert need_scales is False
+
+
+# --- 2026-08 ultrareview (lows): cpm_normalize must be a real boolean --------
+#
+# Before this guard `resolve_target_sum` tested `cpm_normalize` for bare
+# truthiness, so every non-empty string and every non-zero number turned CPM
+# normalization ON. `cpm_normalize='false'` was byte-identical to
+# `cpm_normalize=True` and materially different from the `False` it reads as.
+
+@pytest.mark.parametrize("bad", ["False", "false", "no", "0", "True", 1, 0.5,
+                                 np.float64(0.5), [1], (0,)])
+def test_resolve_target_sum_rejects_non_bool_cpm_normalize(bad):
+    with pytest.raises(ValueError, match="cpm_normalize must be True or False"):
+        resolve_target_sum(cpm_normalize=bad, normalize_target_sum=None,
+                           row_sums=None)
+
+
+@pytest.mark.parametrize("falsey", [None, 0, [], ()])
+def test_resolve_target_sum_rejects_falsey_non_bool_too(falsey):
+    """Rejected in BOTH directions: silently reading None as False is the same
+    class of bug as reading 'false' as True, and only one of them is loud."""
+    with pytest.raises(ValueError, match="cpm_normalize must be True or False"):
+        resolve_target_sum(cpm_normalize=falsey, normalize_target_sum=None,
+                           row_sums=None)
+
+
+@pytest.mark.parametrize("value,want", [(True, 1e6), (False, None),
+                                        (np.bool_(True), 1e6),
+                                        (np.bool_(False), None)])
+def test_resolve_target_sum_accepts_real_and_numpy_bools(value, want):
+    assert resolve_target_sum(cpm_normalize=value, normalize_target_sum=None,
+                              row_sums=None) == want
+
+
+def test_normalize_cpm_flag_rejects_one_element_bool_array():
+    """`.item()` unwraps a 1-element vector too, so ndim==0 is load-bearing."""
+    from gpudge._normalize import normalize_cpm_flag
+    with pytest.raises(ValueError, match="cpm_normalize must be True or False"):
+        normalize_cpm_flag(np.array([True]))

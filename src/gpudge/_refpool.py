@@ -37,6 +37,7 @@ from ._output import (
     assemble_dataframe,
     effect_size_from_u,
     empty_output_frame,
+    log2_ratio,
 )
 from ._shard_stream import (
     _reference_prepass,
@@ -95,7 +96,9 @@ def _auto_gene_chunk_size_inmem(
     the Phase-0 reference-sort transient (n_ref cells) and the Phase-1 target-tile
     transient (max_group_rows cells). Floored at 64, then capped at n_genes and
     (when the result is >= 64) rounded down to a multiple of 64 — so a
-    smaller-than-64 n_genes (only in tests) returns n_genes.
+    smaller-than-64 n_genes (only in tests) returns n_genes, EXCEPT n_genes == 0,
+    which returns 1 so the chunk driver no-ops instead of raising about
+    ``initial_chunk``.
 
     ``n_levels`` is the tau* accumulator ROW count, matching
     ``_stream._auto_gene_chunk_size``: callers pass
@@ -121,7 +124,10 @@ def _auto_gene_chunk_size_inmem(
                          max_group_rows * tile_bytes
                          + 16 * n_combos + 8 * n_levels, 1)
     chunk = max(64, budget // bytes_per_gene)
-    chunk = min(int(chunk), n_genes)
+    # See the twin floor in `_stream._auto_gene_chunk_size`: only n_genes == 0
+    # can drive this to 0, and a 0 makes the chunk driver raise about an
+    # internal parameter name instead of returning the empty frame.
+    chunk = max(1, min(int(chunk), n_genes))
     if chunk >= 64:
         chunk = (chunk // 64) * 64
     return chunk
@@ -457,8 +463,10 @@ def refpool_de_core(
         del X_source, rows, Ls_for_rows
 
     # ---- Phase 2: filters -> assemble -> BH-FDR ----
-    rm_b = np.broadcast_to(ref["ref_mean"], target_mean_acc.shape)
-    log2fc = np.log2((target_mean_acc + epsilon) / (rm_b + epsilon))
+    # See `_output.log2_ratio`: epsilon=0 is documented to yield NaN / +/-inf,
+    # so that divide must not warn (or raise under -W error) -- but a negative
+    # mean is undefined rather than documented and keeps its warning.
+    log2fc = log2_ratio(target_mean_acc, ref["ref_mean"], epsilon)
 
     keep_mask_acc = _streaming_keep_mask(
         n_targets, n_genes, chunk, arith_target_acc, ref["arith_ref"],

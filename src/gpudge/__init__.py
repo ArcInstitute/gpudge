@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 import os
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -22,6 +23,7 @@ from ._csr_dense import (
 from ._gpu_mem import _release_gpu_memory
 from ._ingest import ALL_OTHERS, LEGACY_ALL_OTHERS as _LEGACY_ALL_OTHERS, ingest
 from ._lfc import lfc_base_names, lfc_column_names, normalize_lfc_spec
+from ._normalize import normalize_cpm_flag
 from ._means import group_means
 from ._mwu import _rank_with_ties, _tie_term_per_gene
 from ._fdr import bh_per_group
@@ -29,6 +31,7 @@ from ._output import (
     DEFAULT_OUTPUT_COLUMNS,
     assemble_dataframe,
     effect_size_from_u,
+    log2_ratio,
 )
 from ._stream import (
     _auto_gene_chunk_size,
@@ -303,6 +306,11 @@ def de(
         must equal ``adata`` / the archive gene axis in order. (Streaming only:
         if the archive also designates its own archive reference pool, the external
         pool wins and the archive reference pool is ignored with a ``UserWarning``.)
+        (Streaming only: an archive's OWN reference pool is read WHOLE. A
+        ``reference=`` naming it is validated for membership and does NOT
+        subset it, so on a multi-label pool ``reference='ntc'`` still ranks
+        against every reference row. A sequence naming the labels is accepted
+        too. Pass an external ``reference=<AnnData>`` for a genuine subset.)
         With ``cell_source=`` the pool may also be a bare cells x genes matrix,
         and a group name / ``ALL_OTHERS`` is rejected — there is no ``obs``
         column to resolve them against.
@@ -619,6 +627,9 @@ def de(
           reference-type guards are reached, so nothing raises; gpudge is not the
           one fetching the cells.
     cpm_normalize : bool, default False
+        Must be ``True`` or ``False`` (or a 0-d numpy/torch boolean); anything
+        else raises. Truthy coercion is refused deliberately, as for
+        ``tau_star_se`` -- ``cpm_normalize='false'`` would otherwise mean True.
         If True, normalize each cell to 1e6 total counts on the fly, inside
         the chunk loop. Row sums are computed once over the full X before
         the loop; each per-chunk slice is then multiplied by ``1e6 /
@@ -873,6 +884,17 @@ def de(
         )
     if not math.isfinite(epsilon) or epsilon < 0:
         raise ValueError(f"epsilon must be a finite value >= 0, got {epsilon!r}.")
+    if gpu_gene_chunk_size is not None:
+        # Unvalidated before: a 0 or a negative reached
+        # `run_gene_chunks_with_recovery` and raised about `initial_chunk`, a
+        # name no caller ever passes.
+        if (isinstance(gpu_gene_chunk_size, bool)
+                or not isinstance(gpu_gene_chunk_size, numbers.Integral)
+                or gpu_gene_chunk_size <= 0):
+            raise ValueError(
+                "gpu_gene_chunk_size must be a positive integer or None, got "
+                f"{gpu_gene_chunk_size!r}.")
+        gpu_gene_chunk_size = int(gpu_gene_chunk_size)
     lfc_combos = normalize_lfc_spec(lfc_threshold, lfc_threshold_alt)
     taustar_se = normalize_taustar_se(tau_star_se)
     taustar_levels = normalize_taustar_spec(tau_star, taustar_se=taustar_se)
@@ -896,6 +918,9 @@ def de(
             f"({ALL_OTHERS!r}). The one-vs-rest path ranks all cells jointly, "
             f"which has no per-reference distribution to shift by 2**tau. Use "
             f"an explicit reference (a group name or a control AnnData).")
+    # Strict bool BEFORE the pair-guard below: with bare truthiness
+    # cpm_normalize='false' both escaped this guard and turned CPM on.
+    cpm_normalize = normalize_cpm_flag(cpm_normalize)
     if cpm_normalize and normalize_target_sum is not None:
         raise ValueError(
             "only one of cpm_normalize / normalize_target_sum may be set "
@@ -1243,6 +1268,7 @@ def de(
 
     state = ingest(adata, groupby=groupby, reference=reference)
     n_groups = len(state.unique_labels)
+
     labels_t = torch.from_numpy(state.labels).to(device)
 
     # Auto-pick gene chunk size from free GPU memory if not provided.
@@ -1783,19 +1809,27 @@ def de(
             oom_recovery=oom_recovery,
         )
 
-    if state.ref_label == ALL_OTHERS:
-        rm_b = ref_mean_acc
-    else:
-        rm_b = np.broadcast_to(ref_mean_acc, target_mean_acc.shape)
-    log2fc = np.log2((target_mean_acc + epsilon) / (rm_b + epsilon))
+    # `ref_mean_acc` unbroadcast in BOTH modes: it is already
+    # (n_groups, n_genes) under ALL_OTHERS and (n_genes,) otherwise, and
+    # log2_ratio scans its inputs to decide whether the only reachable warnings
+    # are the documented epsilon=0 ones -- the unbroadcast array says the same
+    # thing for a fraction of the work. Broadcasting still happens in the divide.
+    log2fc = log2_ratio(target_mean_acc, ref_mean_acc, epsilon)
 
     if state.ref_label == ALL_OTHERS:
         target_indices = np.arange(n_groups)
         target_labels = state.unique_labels
     else:
         keep_mask_acc[state.ref_label_idx] = False
+        # dtype=np.intp is load-bearing: on a reference-only input (the sole
+        # group IS the reference) this list is EMPTY, an untyped `np.array([])`
+        # is float64, and numpy refuses a float array as an index -- so the
+        # whole GPU pass ran and then died here with
+        # `IndexError: arrays used as indices must be of integer (or boolean)
+        # type`. With the dtype the tail builds the canonical empty frame.
         target_indices = np.array(
-            [i for i in range(n_groups) if i != state.ref_label_idx]
+            [i for i in range(n_groups) if i != state.ref_label_idx],
+            dtype=np.intp,
         )
         target_labels = state.unique_labels[target_indices]
 

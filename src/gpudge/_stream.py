@@ -150,7 +150,14 @@ def _auto_gene_chunk_size(
     # downshifts instead of crashing.
     budget = min(int(free_bytes * 0.20), 16 * 1024**3)
     chunk = max(16, budget // bytes_per_gene)
-    chunk = min(int(chunk), n_genes)
+    # max(1, ...) is reachable ONLY when n_genes == 0: `chunk` is >= 16 before
+    # the clamp, so the min() can only produce 0 for a zero-gene input. Without
+    # the floor `run_gene_chunks_with_recovery` raises `initial_chunk must be
+    # > 0, got 0` -- an internal name the caller never passed -- while the same
+    # degenerate input WITH an explicit gpu_gene_chunk_size drives the (empty)
+    # chunk loop fine and returns a correctly typed 0-row frame. Flooring at 1
+    # makes the auto path agree: zero chunks run and the caller gets that frame.
+    chunk = max(1, min(int(chunk), n_genes))
     if chunk >= 64:
         chunk = (chunk // 64) * 64
     return chunk
