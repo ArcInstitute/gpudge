@@ -128,3 +128,73 @@ def test_row_scale_needs_truth_table(scale_main, min_cpm_cell, min_cpm_bulk,
                                      expected):
     assert _row_scale_needs(
         scale_main, min_cpm_cell, min_cpm_bulk, median_requested=False) == expected
+
+
+def test_x_has_noncount_signal_never_copies_a_dense_matrix(monkeypatch):
+    """The function samples at most k values; it must not materialise a copy of X.
+
+    np.ravel defaults to order='C', so it COPIED any non-C-contiguous dense input
+    in full -- ~40 GB for a 500k x 20k f32 group, inside a function whose whole
+    job is to read <=100_000 values.
+
+    This SPIES on the flatten call rather than re-deriving it: an assertion that
+    calls np.ravel(X, order='K') itself tests numpy, not gpudge, and passes on the
+    broken implementation (the first version of this test did exactly that --
+    codex caught it). What discriminates is (a) the order actually passed, and
+    (b) whether the returned buffer shares memory with the input, both observed
+    from inside the call. The strided branch must not flatten at all.
+    (ultrareview 2026-08; test corrected after the codex review.)
+    """
+    import numpy as np
+    from gpudge import _filter
+
+    base = np.arange(60_000, dtype=np.float32).reshape(300, 200)
+    layouts = {
+        "C": np.ascontiguousarray(base),
+        "F": np.asfortranarray(base),
+        "strided": base[::2, ::3],           # neither C- nor F-contiguous
+    }
+
+    calls = []
+    real_ravel = np.ravel
+
+    def ravel_spy(a, order=None):
+        out = real_ravel(a) if order is None else real_ravel(a, order=order)
+        calls.append((order, bool(np.shares_memory(out, a))))
+        return out
+
+    monkeypatch.setattr(np, "ravel", ravel_spy)
+
+    for name, X in layouts.items():
+        calls.clear()
+        assert _filter.x_has_noncount_signal(X) is False, name
+        if name == "strided":
+            assert calls == [], (
+                f"strided input flattened anyway: {calls} -- it must be sampled "
+                f"through unravel_index with no flatten at all")
+        else:
+            assert len(calls) == 1, f"{name}: expected one flatten, got {calls}"
+            order, shared = calls[0]
+            assert order == "K", (
+                f"{name}: np.ravel called with order={order!r}, not 'K' -- "
+                f"order='C' copies a non-C-contiguous array in full")
+            assert shared, f"{name}: the flatten returned a COPY, not a view"
+
+    # A fractional value must still be detected in every layout, with the layout
+    # PRESERVED (the earlier version rebuilt the strided case as C-contiguous, so
+    # the strided branch was never exercised with a fraction).
+    frac = {
+        "C": np.ascontiguousarray(base),
+        "F": np.asfortranarray(base),
+        "strided": base.copy()[::2, ::3],
+    }
+    for name, Y in frac.items():
+        Y[1, 1] = 0.5
+        assert Y.flags["C_CONTIGUOUS"] == (name == "C"), name
+        assert Y.flags["F_CONTIGUOUS"] == (name == "F"), name
+        assert _filter.x_has_noncount_signal(Y) is True, name
+
+    # Negative values too, same layouts.
+    for name, Y in frac.items():
+        Y[1, 1] = -3.0
+        assert _filter.x_has_noncount_signal(Y) is True, name

@@ -76,22 +76,25 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
   `tests/conftest.py` — a `skipif`, not a registered marker, which is why
   `pytest -m needs_cuda` selects nothing and exits 5. Run the whole suite.
 - **Run the suite on a CUDA host for any change touching GPU code paths.** CI is
-  CPU-only, so the GPU integration bit-identity gates, the `lfc_threshold` GPU
-  surface and the GPU-backed scanpy comparisons never execute there — though
-  some of that ground is deliberately also covered on CPU, in
-  `tests/test_scanpy_median_contract.py` and the kernel-level gate in
-  `tests/test_mwu_taustar.py`. CI also installs only `[dev,fast]`, so the three
-  shardad-gated suites (`test_shard_stream.py`, `test_cell_stream.py`,
-  `test_inmem_external_ref_gpu.py` — each a module-level
-  `pytest.importorskip("shardad")`) are not even collected. Between them that is
-  138 cases, **68 of which run without a GPU** — so CI is not missing only GPU
-  coverage there. For reference, a checkout with **no**
-  GPU reports **528 passed / 182 skipped**; those skips are mostly CUDA-gated but
-  not only — some need numba, some need external data, and
-  `test_de_requires_cuda` skips when CUDA *is* present. A GPU run has to
-  hard-fail when torch cannot see a GPU, or when shardad/numba are absent —
-  otherwise those tests silently skip, pytest exits 0, and the result is a green
-  gate that tested nothing.
+  CPU-only, so the GPU bit-identity gates, the `lfc_threshold` GPU surface and
+  the GPU-backed scanpy-parity assertions never execute there — but "CI covers
+  none of that ground" is too strong: `tests/test_scanpy_median_contract.py`
+  exists *precisely* because every other test of that parity claim is
+  `needs_cuda`, and the kernel-level `tau_star_se` release gate in
+  `tests/test_mwu_taustar.py` runs on CPU by design. CI also installs only
+  `[dev,fast]`, so the **three** shardad-gated suites (`test_shard_stream.py`,
+  `test_cell_stream.py`, `test_inmem_external_ref_gpu.py` — each a module-level
+  `pytest.importorskip("shardad")`) are not collected at all.
+
+  Counts, measured 2026-08-18 — do not propagate them without re-measuring. This
+  tree with **no** GPU reports **537 passed / 188 skipped**, and its CI reports
+  **469 passed / 120 skipped** — 116 CUDA-gated cases, the 3 module-level shardad
+  skips, and the one real-data test. The three shardad suites hold **139 cases,
+  68 of which need no GPU at all** (33 + 35 + 0 pass on a GPU-less host), so what
+  CI misses there is not only GPU coverage. A GPU run has to hard-fail when torch
+  cannot see a GPU, or when shardad/numba are absent — otherwise those tests
+  silently skip, pytest exits 0, and the result is a green gate that tested
+  nothing.
 - For non-trivial changes: branch, get the diff reviewed, open a PR, and merge
   only once review and CI are green.
 - Comments and tests cite design-spec sections by label (`spec 3.2b`,
@@ -107,13 +110,16 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
   the reference groups lead contiguously from row 0, because shardad's own
   `read_reference()` gathers `[0, max reference stop)` and would otherwise
   silently pull target cells into the reference pool.
-- `csr_row_sums`'s non-numba fallback widens a sparse `X.data` to float64
-  itself and lets scipy reduce that. Passing `dtype=` to scipy's sparse `.sum()`
-  is **not** enough — whether it widens the accumulator or only the result varies
-  by scipy version (CI caught it reducing in float32 on 3.11 while 3.12 was
-  fine). Without the widening scipy reduces in `X.data`'s dtype: the cell gather
-  hands gpudge float32, the shard reader can hand it a narrow integer dtype, and
-  the two layouts then disagree on CPM scales once a library size passes 2**24.
+- `csr_row_sums`'s non-numba fallback **widens a sparse `X.data` to float64
+  itself** and lets scipy reduce that. Passing `dtype=` to scipy's *sparse*
+  `.sum()` is **not** enough — whether it widens the accumulator or only the
+  result varies by scipy version, and CI caught it reducing in float32 on 3.11
+  while 3.12 happened to be fine (`_csr_dense.py` says so at the call site).
+  numpy's *dense* `.sum(dtype=)` does honour the accumulator, so the dense branch
+  passes it. Without the widening scipy reduces in `X.data`'s dtype: the cell
+  gather hands gpudge float32, the shard reader can hand it a narrow integer
+  dtype, and the two layouts then disagree on CPM scales once a library size
+  passes 2**24.
 - Cross-layout byte-identity holds only for archives written with **default
   ordering**. shardad v0.7.1's cell writer converts categorical
   `sort_within_group` keys with `.to_numpy()` (dropping category order) where the

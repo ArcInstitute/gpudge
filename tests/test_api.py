@@ -73,8 +73,11 @@ def test_de_all_others_reference(synth_small):
 @needs_cuda
 def test_de_csc_input_matches_csr_literal_ref(synth_small_sparse):
     """A CSC adata.X is coerced to CSR (exactly one warning) and yields
-    bit-identical output to the CSR-input run. Literal-reference path mutates
-    adata.X in place (its densify contract). #66"""
+    bit-identical output to the CSR-input run. A MATERIALIZED AnnData is coerced
+    IN PLACE — deliberate, and load-bearing for memory: it drops the caller's CSC
+    refcount so only one sparse encoding is live (#66 design). Views cannot be
+    rebound and keep a local instead; see
+    test_de_on_a_csc_view_gets_the_CSR_fast_path. #66, ultrareview 2026-08"""
     import warnings as _w
     from polars.testing import assert_frame_equal
     csr_adata = synth_small_sparse                 # CSR from the fixture
@@ -87,8 +90,12 @@ def test_de_csc_input_matches_csr_literal_ref(synth_small_sparse):
     coerce = [w for w in rec if "converting to CSR" in str(w.message)]
     assert len(coerce) == 1
     keys = ["target", "feature"]
-    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys))
-    assert csc_adata.X.format == "csr"             # coerced in place
+    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys),
+                       check_exact=True)
+    assert csc_adata.X.format == "csr"             # materialized input: coerced
+    #                                                in place, per the #66 memory
+    #                                                contract (a local copy would
+    #                                                keep both encodings live).
 
 
 @needs_cuda
@@ -111,7 +118,8 @@ def test_de_csc_all_others_not_coerced(synth_small_sparse):
     assert len(coerce) == 0                         # ALL_OTHERS is not coerced
     assert csc_adata.X.format == "csc"              # left untouched
     keys = ["target", "feature"]
-    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys))
+    assert_frame_equal(df_csr.sort(keys), df_csc.sort(keys),
+                       check_exact=True)
 
 
 @needs_cuda
@@ -178,8 +186,15 @@ def test_de_chunk_size_invariance(synth_medium):
     assert small.height == whole.height           # same row set across chunks
     j = small.join(whole, on=["target", "feature"], suffix="_w")
     assert j.height == whole.height               # exact (target, feature) match
+    # EXACT: chunk-invariance is a bit-identity contract (de()'s docstring says
+    # results are identical regardless of chunk size), and a 1e-6 tolerance
+    # masked precisely the 1-2 ULP tie-term drift the 2026-08 ultrareview found
+    # end-to-end. NaN positions must align too.
     for col in ("log2_fold_change", "p_value", "p_adj"):
-        assert (j[col] - j[f"{col}_w"]).abs().max() < 1e-6
+        x, y = j[col].to_numpy(), j[f"{col}_w"].to_numpy()
+        assert np.array_equal(x, y, equal_nan=True), (
+            f"{col}: not chunk-invariant (max abs diff "
+            f"{np.nanmax(np.abs(x - y))})")
 
 
 @needs_cuda
@@ -208,8 +223,15 @@ def test_de_oom_recovery_downshift_matches_small_chunk(synth_medium, monkeypatch
     assert got.height == want.height
     j = got.join(want, on=["target", "feature"], suffix="_w")
     assert j.height == want.height
+    # EXACT: chunk-invariance is a bit-identity contract (de()'s docstring says
+    # results are identical regardless of chunk size), and a 1e-6 tolerance
+    # masked precisely the 1-2 ULP tie-term drift the 2026-08 ultrareview found
+    # end-to-end. NaN positions must align too.
     for col in ("log2_fold_change", "p_value", "p_adj"):
-        assert (j[col] - j[f"{col}_w"]).abs().max() < 1e-6
+        x, y = j[col].to_numpy(), j[f"{col}_w"].to_numpy()
+        assert np.array_equal(x, y, equal_nan=True), (
+            f"{col}: not chunk-invariant (max abs diff "
+            f"{np.nanmax(np.abs(x - y))})")
 
 
 @needs_cuda
@@ -245,8 +267,15 @@ def test_de_all_others_chunk_size_invariance(synth_medium):
     assert small.height == whole.height           # same row set across chunks
     j = small.join(whole, on=["target", "feature"], suffix="_w")
     assert j.height == whole.height               # exact (target, feature) match
+    # EXACT: chunk-invariance is a bit-identity contract (de()'s docstring says
+    # results are identical regardless of chunk size), and a 1e-6 tolerance
+    # masked precisely the 1-2 ULP tie-term drift the 2026-08 ultrareview found
+    # end-to-end. NaN positions must align too.
     for col in ("log2_fold_change", "p_value", "p_adj"):
-        assert (j[col] - j[f"{col}_w"]).abs().max() < 1e-6
+        x, y = j[col].to_numpy(), j[f"{col}_w"].to_numpy()
+        assert np.array_equal(x, y, equal_nan=True), (
+            f"{col}: not chunk-invariant (max abs diff "
+            f"{np.nanmax(np.abs(x - y))})")
 
 
 @needs_cuda
@@ -278,8 +307,15 @@ def test_de_all_others_oom_recovery_downshift_matches_small_chunk(synth_medium,
     assert got.height == want.height              # no rows lost on the retry
     j = got.join(want, on=["target", "feature"], suffix="_w")
     assert j.height == want.height                # exact (target, feature) match
+    # EXACT: chunk-invariance is a bit-identity contract (de()'s docstring says
+    # results are identical regardless of chunk size), and a 1e-6 tolerance
+    # masked precisely the 1-2 ULP tie-term drift the 2026-08 ultrareview found
+    # end-to-end. NaN positions must align too.
     for col in ("log2_fold_change", "p_value", "p_adj"):
-        assert (j[col] - j[f"{col}_w"]).abs().max() < 1e-6
+        x, y = j[col].to_numpy(), j[f"{col}_w"].to_numpy()
+        assert np.array_equal(x, y, equal_nan=True), (
+            f"{col}: not chunk-invariant (max abs diff "
+            f"{np.nanmax(np.abs(x - y))})")
 
 
 # --- ultrareview: fail-fast entry-point validation (GPU-free; the guards fire
@@ -629,3 +665,160 @@ def test_tau_star_se_is_documented_with_its_domain_caveat():
     # proves exactly the intended claim and survives the block growing.
     block = doc.split("tau_star_se : bool")[1].split("gpu_gene_chunk_size :")[0]
     assert "normalize_target_sum" in block
+
+
+def test_densify_input_on_a_view_raises_before_any_gpu_work(synth_small_sparse):
+    """densify_input=True cannot be honoured on an AnnData VIEW: assigning to a
+    view's .X writes THROUGH to the parent instead of rebinding, so the dense
+    array was built, scattered back into the parent and discarded -- the caller
+    paid the full dense allocation (~310 GB peak at CCL_2 scale per the docstring)
+    for no speedup, after a warning saying the mutation had happened.
+
+    Deliberately NOT @needs_cuda: the guard is a preflight that runs before the
+    torch.cuda.is_available() probe, so this pins the ordering too -- a
+    regression that moved the check later would fail here on a CPU-only host.
+    (codex review of the ultrareview 2026-08 fix.)
+    """
+    view = synth_small_sparse[synth_small_sparse.obs["comparison"] != "__none__"]
+    assert view.is_view                                # sanity: really a view
+    with pytest.raises(ValueError, match=r"adata\.copy\(\)"):
+        de(view, groupby="comparison", reference="ntc", densify_input=True)
+
+
+@needs_cuda
+def test_de_on_a_csc_view_gets_the_CSR_fast_path(synth_small_sparse, monkeypatch):
+    """A CSC-backed VIEW must reach the numba CSR gather, and the caller's matrix
+    must be untouched.
+
+    Spying on the gather is the only assertion that DISCRIMINATES. Under the
+    pre-fix `adata.X = ensure_csr(...)`, anndata wrote the CSR back through into
+    the parent and re-read the parent slice, so `adata.X` stayed a
+    SparseCSCMatrixView -- but the parent stayed CSC and the OUTPUT stayed
+    correct, only slower. So checking output + `parent.X.format` (as the first
+    version of this test did) passes on the buggy code too; what actually broke
+    was that every gather tile fell back to scipy slicing, the regression #66
+    added the coercion to prevent. (codex review round 2.)
+    """
+    import scipy.sparse as _sp
+    from polars.testing import assert_frame_equal
+    parent = synth_small_sparse.copy()
+    parent.X = parent.X.tocsc()
+    view = parent[parent.obs["comparison"] != "__none__"]
+    assert view.is_view
+
+    seen = []
+    real = gpudge.csr_rows_col_range_to_dense
+
+    def spy(X, *args, **kwargs):
+        seen.append(X.format if _sp.issparse(X) else f"dense:{type(X).__name__}")
+        return real(X, *args, **kwargs)
+
+    monkeypatch.setattr(gpudge, "csr_rows_col_range_to_dense", spy)
+    keys = ["target", "feature"]
+    got = de(view, groupby="comparison", reference="ntc").sort(keys)
+
+    assert seen, "the gather was never called -- the spy is not wired up"
+    assert set(seen) == {"csr"}, f"gather saw non-CSR input: {sorted(set(seen))}"
+    assert parent.X.format == "csc"          # caller's matrix untouched
+
+    monkeypatch.setattr(gpudge, "csr_rows_col_range_to_dense", real)
+    materialised = view.to_memory() if hasattr(view, "to_memory") else view.copy()
+    materialised.X = materialised.X.tocsr()
+    exp = de(materialised, groupby="comparison", reference="ntc").sort(keys)
+    assert_frame_equal(got, exp, check_exact=True)
+
+
+@needs_cuda
+def test_densify_input_releases_the_sparse_matrix_before_the_chunk_loop(
+        synth_small_sparse, monkeypatch):
+    """densify_input=True must release the sparse encoding BEFORE the gene-chunk
+    loop, not merely by the time de() returns.
+
+    Observing a weakref after de() returns proves nothing: CPython destroys the
+    function frame on return, so every internal local dies regardless and the
+    test passes with or without the fix (I wrote that version first and it did
+    exactly that). The contract is about PEAK memory *during* the call — holding
+    the sparse matrix alongside the dense one is the ~310 GB at CCL_2 scale that
+    densify_input exists to avoid — so the observation has to happen mid-call.
+    This hooks the gather, which runs after densification, and checks the sparse
+    matrix is already unreachable at that point. (codex review round 4.)
+    """
+    import gc
+    import weakref
+    a = synth_small_sparse.copy()
+    sparse_ref = weakref.ref(a.X)
+    observed = []
+    real = gpudge.csr_rows_col_range_to_dense
+
+    def spy(X, *args, **kwargs):
+        if not observed:                     # first gather call only
+            gc.collect()
+            observed.append(sparse_ref() is None)
+        return real(X, *args, **kwargs)
+
+    monkeypatch.setattr(gpudge, "csr_rows_col_range_to_dense", spy)
+    with pytest.warns(UserWarning, match="densify_input=True"):
+        de(a, groupby="comparison", reference="ntc", densify_input=True)
+    assert observed, "the gather never ran -- the spy is not wired up"
+    assert observed[0], (
+        "the sparse matrix was still reachable when the chunk loop started: "
+        "densify_input freed nothing, so sparse and dense were both resident")
+
+
+@needs_cuda
+def test_densify_input_releases_the_COERCED_csr_before_the_chunk_loop(
+        synth_small_sparse, monkeypatch):
+    """Same contract on the CSC path: the CSR that ensure_csr produced must also
+    be gone by the time the chunk loop runs. (codex review round 4.)"""
+    import gc
+    import weakref
+    captured = {}
+    real_ensure = gpudge.ensure_csr
+    real_gather = gpudge.csr_rows_col_range_to_dense
+    observed = []
+
+    def ensure_spy(X, **kwargs):
+        out = real_ensure(X, **kwargs)
+        if out is not X:
+            captured["ref"] = weakref.ref(out)
+        return out
+
+    def gather_spy(X, *args, **kwargs):
+        if not observed and "ref" in captured:
+            gc.collect()
+            observed.append(captured["ref"]() is None)
+        return real_gather(X, *args, **kwargs)
+
+    monkeypatch.setattr(gpudge, "ensure_csr", ensure_spy)
+    monkeypatch.setattr(gpudge, "csr_rows_col_range_to_dense", gather_spy)
+    a = synth_small_sparse.copy()
+    a.X = a.X.tocsc()
+    with pytest.warns(UserWarning):          # coercion + densify warnings
+        de(a, groupby="comparison", reference="ntc", densify_input=True)
+    assert "ref" in captured, "ensure_csr never coerced -- the spy is not wired up"
+    assert observed, "the gather never ran -- the spy is not wired up"
+    assert observed[0], (
+        "the coerced CSR was still reachable when the chunk loop started")
+
+
+
+
+
+@needs_cuda
+def test_de_is_silent_on_the_tie_fallback(synth_small, monkeypatch):
+    """A real de() run that hits the tie-correction fallback emits NO warning.
+
+    Pins the documented contract end-to-end (see de()'s gpu_gene_chunk_size
+    docstring): the limitation is documented, not warned about. Discriminating —
+    re-wiring a warning into any entry point fails this. (PR #124.)
+    """
+    import warnings as _w
+    import gpudge._mwu as _mwu
+    monkeypatch.setattr(_mwu, "_TIE_INT64_MAX_K", 8)   # force the fallback
+    with _w.catch_warnings(record=True) as rec:
+        _w.simplefilter("always")
+        out = de(synth_small, groupby="comparison", reference="ntc")
+    assert out.height > 0
+    noisy = [r for r in rec if "gpu_gene_chunk_size" in str(r.message)
+             or "tie-correction" in str(r.message)]
+    assert not noisy, f"de() warned about the fallback: {[str(r.message) for r in noisy]}"

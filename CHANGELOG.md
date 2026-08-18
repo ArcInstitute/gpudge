@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+Eight defects from the 2026-08 whole-codebase ultrareview (8 subsystem reviewers
+filed 41 findings; 39 were put through adversarial verifiers executing on an
+H100, and 3 were refuted and are not listed here).
+
+- ⚠️ **`de()` p-values are chunk-invariant up to a stated bound, and this MAY
+  CHANGE output** by an amount *observed* to be 1–2 ULP on `p_value` / `p_adj`
+  (not a guaranteed bound). The tie-correction term is an exact integer wherever
+  the tie axis fits int64 — see the fallback note below for where it is not, and
+  note that "exact" describes the tie sum; the p-value remains a float64 function
+  of it. Whether a given gene moves depends on its whole tie
+  profile, not on any single run: the *aggregate* Σ(t³−t) has to exceed 2⁵³, and
+  neither a threshold on the largest run nor one on the cell count predicts it.
+  Measured both ways — a single 420 000-cell run is unchanged, while four runs of
+  195 020 / 188 824 / 195 246 / 116 410 (every one of them *below* that scale)
+  shift by 4. **Raw counts are affected**, routinely, through the zero run. (The
+  *chunk-dependence* itself was narrower — it needed the block's max run count to
+  swing across ~1e5, so it was reachable on the normalized paths and measured at
+  0/64 rows on raw counts. Two different scopes; do not conflate them.)
+  `_mwu._tie_term_per_gene` accumulated Σ(t³−t) in
+  float64 into a `(block_height, n_runs)` buffer whose **both** dimensions are
+  per-block quantities; torch's row sum is shape-sensitive, so past 2⁵³ a gene's
+  tie term depended on which genes shared its chunk, and two `de()` calls
+  differing only in `gpu_gene_chunk_size` returned bit-differing p-values —
+  falsifying the invariant `tests/test_api.py` and
+  `tests/test_taustar_integration.py` assert. Now accumulated in **int64**, exact
+  for a tie axis ≤ 2 097 151 and order-free, with a float64 fallback above that.
+  `_rank_with_ties` (the ALL_OTHERS tie term) had the same coupling through
+  `max_tgroups` and is fixed the same way. Fixing only the zero-pad *width* does
+  not work — block height still varies. The cross-tie decomposition
+  (`ref_tie_term + Σ[f(rc+gc) − f(rc)]`) is now summed in int64 as well and cast
+  **once**: leaving the reference term exact while the delta subtracted a float64
+  `f(rc)` broke the cancellation and left a full pooled ULP of error — measured
+  at −16 on 7.2e16 for a 416 134-cell zero run with one tied target cell, and
+  pinned by `test_pooled_tie_term_cancels_exactly_at_a_large_reference_run`.
+  Above the int64 bound the reduction falls back to float64 and chunk-invariance
+  no longer holds. There are two routes past the bound — the reference tie axis
+  itself (`n_ref`, or all cells under `ALL_OTHERS`) and the pooled `n_ref + m` —
+  and **both are documented rather than warned about**: `de()`'s
+  `gpu_gene_chunk_size` docstring states the condition and the remedy (pin a chunk
+  that fits **and** pass `oom_recovery=False` — that combination fixes the
+  reduction shape, which is what makes the inexact float64 result reproducible; a
+  pinned chunk alone is not enough, because the default `oom_recovery=True` halves
+  even an explicit chunk on OOM and can do so mid-run). A runtime warning was tried and dropped: it cannot be
+  made both per-invocation and free inside the per-(group, chunk) inner loop, and
+  it guarded a condition that needs a >2e6-cell tie axis and never changed a
+  computed value.
+- **`de(adata=<AnnData view>, …)` no longer silently loses the CSC→CSR
+  coercion.** Assigning to a view's `.X` writes through to the parent instead of
+  rebinding, so the coercion vanished while its warning claimed success —
+  dropping every gather tile onto scipy slicing, the regression
+  [#66](https://github.com/ArcInstitute/gpudge_arc/issues/66) added it to
+  prevent. On an already-CSR view the assignment also ran a full
+  O(n_obs × n_var) sparse scatter into the caller's matrix. The coerced matrix is
+  now bound to a local **for views only**. A materialized `AnnData` is still
+  coerced in place, unchanged from 0.7.0: that is deliberate and load-bearing for
+  memory — it drops the caller's CSC/COO refcount so only one sparse encoding is
+  resident, and holding a local copy instead would keep both live for the whole
+  run and could turn a large supported CSC input into a host OOM. The assignment
+  now also happens **only when `ensure_csr` actually returned a different
+  object**, so an already-CSR input no longer pays a pointless
+  O(n_obs × n_var) sparse scatter.
+- **`densify_input=True` now raises on an AnnData view** instead of paying the
+  full dense allocation (~310 GB peak at CCL_2 scale) and discarding it, having
+  already warned that the caller's matrix was mutated. Pass `adata.copy()`.
+- **Cell- and shard-layout streaming reject unassigned cells.** A cell with a
+  NaN/None group label reaches an archive as a group literally named `'nan'`,
+  which the in-memory path has always refused; streaming emitted it as a target
+  group with no warning at all. Both backends now screen the group table through
+  one shared policy (`_ingest.reject_missing_group_labels`), which also covers
+  the shard layout's target side — its reference side was already guarded.
+- **The streaming auto gene-chunk sizer budgets the Phase-1 target tile
+  unconditionally**, not only when `lfc_threshold` or `tau_star` is active. A
+  target-dominated workload previously got a chunk sized for the reference sort
+  alone and paid an OOM downshift, or an outright OOM under
+  `oom_recovery=False`. This also makes it agree with
+  `_auto_gene_chunk_size_inmem`. Callers that cannot know the tile height still
+  pass `max_group_rows=0` and are unaffected.
+- **The reference-residency guard trims the caching allocators before reading
+  free VRAM.** It is a hard guard, and it was refusing runs with "use a
+  larger-memory GPU" for references that fit, because torch/cupy still held
+  cached-but-unused blocks from an earlier `de()` in the same process. The two
+  *soft sizer* read sites are deliberately left alone — deferring the reclaim
+  there is a documented decision in the #76 design.
+- **`_filter.x_has_noncount_signal` no longer copies the whole dense matrix** to
+  sample ≤100 000 values. `np.ravel` defaults to `order='C'` and so copied any
+  non-C-contiguous input in full (~40 GB for a 500k × 20k f32 group); it now uses
+  `order='K'` — a view for both C and F layouts — and `unravel_index` sampling
+  for genuinely strided input.
+- **Byte-identity gates now actually check byte-identity.** Every
+  `assert_frame_equal` in the suite passes `check_exact=True`: polars defaults to
+  `check_exact=False` with `rel_tol=1e-5`, which had silently turned the
+  in-memory external-reference **merge gate**
+  (`tests/test_inmem_external_ref_gpu.py`, 8 assertions) and three other identity
+  claims into tolerance checks that a 1-float32-ULP relative drift passed at
+  every magnitude. Third occurrence of this trap in the repo. All of them pass
+  exactly on an H100, so the paths were identical — only the gates were blind.
+
 ## [0.7.0] — 2026-08-02
 
 ### Added

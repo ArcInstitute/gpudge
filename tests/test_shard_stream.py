@@ -242,7 +242,9 @@ def test_external_pool_ignores_archive_reference_shard(archive_ref_and_noref):
     got_s = got.sort(keys)
     exp_s = exp.sort(keys)
     from polars.testing import assert_frame_equal
-    assert_frame_equal(got_s, exp_s)
+    # check_exact=True is load-bearing: the docstring claims identity, and
+    # polars defaults to a 1e-5 relative tolerance. (ultrareview 2026-08)
+    assert_frame_equal(got_s, exp_s, check_exact=True)
 
 
 def test_resolve_non_grouped_archive_raises(tmp_path):
@@ -1171,3 +1173,47 @@ def test_stream_empty_targets_with_tau_star(archive_mode1, tmp_path):
         list(output_columns)).rename(output_columns).head(0)
     assert_frame_equal(selected_empty, selected_populated,
                        check_dtypes=True, check_exact=True)
+
+
+@needs_cuda
+def test_reference_residency_guard_trims_allocators_before_reading_free_vram(
+        monkeypatch):
+    """The residency guard is a HARD guard -- a false negative refuses the run
+    with "use a larger-memory GPU" for a reference that fits. It must therefore
+    read free VRAM only AFTER the caching allocators are trimmed, or a previous
+    de() in the same process can make it lie.
+
+    Discriminating: asserts the ORDER of the two calls, so moving the trim after
+    the read (or dropping it) fails. Deliberately does not assert on the two soft
+    SIZER read sites -- deferring the reclaim there is a documented decision in
+    the #76 design. (ultrareview 2026-08.)
+    """
+    import numpy as np
+    import scipy.sparse as sp
+    from gpudge import _shard_stream as _ss
+
+    order = []
+    real_release = _ss._release_gpu_memory
+    real_free = _ss._free_gpu_bytes
+
+    def release_spy(*a, **k):
+        order.append("trim")
+        return real_release(*a, **k)
+
+    def free_spy(*a, **k):
+        order.append("read_free")
+        return real_free(*a, **k)
+
+    monkeypatch.setattr(_ss, "_release_gpu_memory", release_spy)
+    monkeypatch.setattr(_ss, "_free_gpu_bytes", free_spy)
+
+    ref_X = sp.csr_matrix(np.arange(40, dtype=np.float32).reshape(8, 5))
+    _ss._reference_prepass(
+        ref_X, 5, torch.device("cuda"), 5, mean_calc="arithmetic",
+        scale_main=False, scale_num=1.0e6, need_other_unit=False,
+        need_row_sums=False, need_row_scales=False, oom_recovery=False)
+
+    assert "trim" in order, "the allocators were never trimmed"
+    assert "read_free" in order, "free VRAM was never read -- spy not wired up"
+    assert order.index("trim") < order.index("read_free"), (
+        f"free VRAM was read before the trim: {order}")

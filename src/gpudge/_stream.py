@@ -127,7 +127,18 @@ def _auto_gene_chunk_size(
     # iteration). Gated on either feature so `bytes_per_gene` is EXACTLY
     # unchanged when both are inactive -- do NOT fold this into the expression
     # above.
-    if n_combos or n_levels:
+    # UN-GATED as of the 2026-08 ultrareview: modelled whenever the caller knows
+    # the tile height, not only when a tau grid or tau* is active. The old
+    # `if n_combos or n_levels` gate was a scope decision that kept n_combos=0
+    # byte-identical while lfc_threshold landed, and it left the BASE streaming
+    # path budgeting only the Phase-0 reference sort — a target-dominated
+    # workload then got a chunk too large for Phase 1 and paid an OOM downshift
+    # (or, with oom_recovery=False, an outright OOM). `_auto_gene_chunk_size_inmem`
+    # already modelled it unconditionally, so this also makes the two sizers
+    # agree. The feature tiles stay conditional addends; `_TARGET_TILE_BYTES`
+    # alone is the no-feature cost. Callers that cannot know the tile pass
+    # max_group_rows=0 (cell_source_de) and are unaffected.
+    if max_group_rows > 0 or n_combos or n_levels:
         target_peak = (budget_n * 4
                        + max_group_rows * (
                            _TARGET_TILE_BYTES

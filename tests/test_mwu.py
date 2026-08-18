@@ -127,7 +127,10 @@ def test_tie_term_per_gene_multi_block(monkeypatch):
     full = _mwu._tie_term_per_gene(x)                 # single block (default budget)
     monkeypatch.setattr(_mwu, "_TIE_BLOCK_ELEMS", 8)  # 8 // k(=8) -> 1 gene/block
     multi = _mwu._tie_term_per_gene(x)                # multi-block path (6 blocks)
-    assert torch.allclose(full, multi)
+    # EXACT, not allclose: the whole point of the int64 accumulation is that the
+    # block shape cannot move the value, and allclose would mask exactly the
+    # 1-2 ULP drift that was the bug. (codex review, ultrareview 2026-08)
+    assert torch.equal(full, multi)
 
 
 def test_tie_term_per_gene_empty_inputs():
@@ -242,3 +245,166 @@ def test_bounds_matches_native_mixed_dtype_cuda():
     """Run on CUDA too -- this is a claim about rounding, and the CPU and CUDA
     searchsorted kernels are independent implementations."""
     _assert_bounds_matches_native("cuda")
+
+
+def test_pooled_tie_term_cancels_exactly_at_a_large_reference_run():
+    """ref_tie_term + cross-delta must reproduce f(r+g) EXACTLY.
+
+    The tie term is decomposed as f(reference runs) + sum[f(rc+gc) - f(rc)], so
+    the -f(rc) has to cancel the +f(rc) bit-for-bit. Once f(rc) passes 2**53
+    float64 cannot represent it, and computing one side in int64 and the other in
+    float64 leaves a residue of a full pooled ULP. r = 416_134 with ONE tied
+    target cell is a raw-count zero run, i.e. the ordinary case, not a contrived
+    one -- it was measured at -16 on a value of 7.2e16 before the fix.
+    (codex review of the ultrareview 2026-08 tie fix.)
+    """
+    from gpudge._mwu import (
+        _pool_tie, _tie_delta_from_rc, _tie_exact, _tie_term_per_gene,
+    )
+    r, g = 416_134, 1
+    exact = (r + g) ** 3 - (r + g)                    # python int ground truth
+    assert exact > 2 ** 53                            # the regime that matters
+    ref = _tie_term_per_gene(torch.zeros(1, r, dtype=torch.float64))
+    assert ref.dtype == torch.int64                   # exact regime engaged
+    ex = _tie_exact(ref, m=g, n_ref=r)
+    assert ex
+    delta = _tie_delta_from_rc(torch.tensor([[r]]), torch.tensor([[g]]),
+                               torch.tensor([[True]]), exact=ex)
+    assert delta.dtype == torch.int64
+    assert float(_pool_tie(ref, delta).item()) == float(exact)
+
+
+def test_tie_exact_uses_the_POOLED_size_not_just_the_reference():
+    """The merged run length is bounded by n_ref + m, so the int64 cube bound
+    has to be tested against the pooled size. A reference just inside the bound
+    with a target that pushes the pool past it must fall back."""
+    from gpudge._mwu import _TIE_INT64_MAX_K, _tie_exact
+    ref_i64 = torch.zeros(3, dtype=torch.int64)
+    assert _tie_exact(ref_i64, m=1, n_ref=_TIE_INT64_MAX_K - 1)
+    assert not _tie_exact(ref_i64, m=2, n_ref=_TIE_INT64_MAX_K - 1)
+    # A float64 reference term is never exact, whatever the sizes.
+    assert not _tie_exact(torch.zeros(3, dtype=torch.float64), m=1, n_ref=10)
+
+
+def _tie_column(run_lengths):
+    """A single sorted gene column with exactly these tie-run lengths."""
+    vals = []
+    for level, t in enumerate(run_lengths):
+        vals += [float(level)] * t
+    return torch.tensor(vals, dtype=torch.float64).unsqueeze(0)
+
+
+def _assert_tie_exactness(device):
+    """The tie term is an EXACT integer above 2**53 -- the property that makes the
+    reduction order-free, and therefore chunk-invariant.
+
+    This is deliberately a test of the MECHANISM, not of an observed float64
+    ordering artifact: the earlier version of this test compared a gene's tie
+    term across block heights, which the pre-fix float64 implementation also
+    passed (the reduction happened to be order-stable for that fixture), so it
+    could not fail. Asserting exact integer arithmetic discriminates: the pre-fix
+    path returns float64 and cannot represent the value at all. The float64
+    sub-case below proves that, so this test cannot silently stop testing.
+    (codex review round 2 of the ultrareview 2026-08 fix.)
+    """
+    import warnings as _w
+    import gpudge._mwu as _mwu
+    runs = [420_000, 7, 5, 3, 2]
+    expected = sum(t ** 3 - t for t in runs)
+    assert expected > 2 ** 53                     # the regime that matters
+    col = _tie_column(runs).to(device)
+
+    got = _mwu._tie_term_per_gene(col)
+    assert got.dtype == torch.int64, "exact regime must accumulate in int64"
+    assert int(got[0].item()) == expected
+
+    # Self-validation: force the float64 path and show it is NOT exact, i.e. this
+    # assertion really does discriminate the fix from the pre-fix behaviour.
+    orig = _mwu._TIE_INT64_MAX_K
+    try:
+        _mwu._TIE_INT64_MAX_K = 1
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", RuntimeWarning)
+            loose = _mwu._tie_term_per_gene(col)
+        assert loose.dtype == torch.float64
+        assert int(loose[0].item()) != expected   # float64 cannot hold it
+    finally:
+        _mwu._TIE_INT64_MAX_K = orig
+
+
+def test_tie_term_is_exact_above_2p53_cpu():
+    _assert_tie_exactness("cpu")
+
+
+@needs_cuda
+def test_tie_term_is_exact_above_2p53_cuda():
+    """Run on CUDA too: the reduction kernel is a separate implementation, and
+    the defect this fixes was observed on an H100."""
+    _assert_tie_exactness("cuda")
+
+
+
+
+def test_rank_with_ties_is_exact_below_the_bound():
+    """Below the bound the counts are int64 and the tie term is exact, with no
+    warning at all."""
+    import warnings as _w
+    import gpudge._mwu as _mwu
+    x = torch.tensor([[1.0], [1.0], [2.0], [3.0]], dtype=torch.float64)
+    with _w.catch_warnings():
+        _w.simplefilter("error", RuntimeWarning)   # any warning fails the test
+        ranks, tie = _mwu._rank_with_ties(x)
+    assert float(tie[0].item()) == 6.0
+    assert ranks.shape == x.shape
+
+
+
+def test_tie_term_empty_input_dtype_follows_the_exact_regime():
+    """An empty chunk must report the SAME regime as a populated one, or
+    _tie_exact sees float64 and silently drops the pooled sum off the exact path.
+    (Copilot review, PR #124.)"""
+    from gpudge._mwu import _tie_term_per_gene, tie_acc_dtype
+    for shape in ((0, 5), (3, 0)):
+        out = _tie_term_per_gene(torch.empty(shape))
+        assert out.dtype == tie_acc_dtype(shape[1]), shape
+        assert out.shape == (shape[0],)
+    # Consistency with the populated path at the same width.
+    populated = _tie_term_per_gene(_tie_column([2, 3]))
+    empty = _tie_term_per_gene(torch.empty((0, 5)))
+    assert populated.dtype == empty.dtype
+
+
+
+
+
+
+def test_kernels_never_warn_about_the_fallback():
+    """gpudge does NOT warn on the tie-correction fallback, anywhere.
+
+    This is the contract now, not an implementation detail: the limitation is
+    documented in de()'s `gpu_gene_chunk_size` docstring instead. A runtime warning
+    was attempted across four review rounds and every shape was wrong — an
+    in-kernel warn puts a frame walk and an eager f-string in the (group x chunk)
+    nested loops, module-level throttling was not per-invocation and broke under
+    `ignore`/`error` filters, and a hardcoded stacklevel named gpudge internals on
+    the streaming paths.
+
+    Discriminating: `simplefilter("error")` turns ANY warning into a failure, so
+    re-adding one here fails immediately — and whoever does must update the
+    docstring too. (PR #124.)
+    """
+    import warnings as _w
+    import gpudge._mwu as _mwu
+    orig = _mwu._TIE_INT64_MAX_K
+    try:
+        _mwu._TIE_INT64_MAX_K = 2                       # force every fallback
+        with _w.catch_warnings():
+            _w.simplefilter("error")                    # ANY warning -> failure
+            _mwu._tie_term_per_gene(_tie_column([2, 2, 2]))
+            _mwu._rank_with_ties(torch.tensor([[1.0], [1.0], [2.0]],
+                                              dtype=torch.float64))
+            for _ in range(50):                         # the hot path
+                assert not _mwu._tie_exact(torch.zeros(2, dtype=torch.int64),
+                                           m=10, n_ref=10)
+    finally:
+        _mwu._TIE_INT64_MAX_K = orig

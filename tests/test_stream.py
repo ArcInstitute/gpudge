@@ -99,18 +99,27 @@ def test_auto_gene_chunk_size_shrinks_monotonically_in_n_combos():
 
 
 def test_auto_gene_chunk_size_budgets_a_target_dominated_workload():
-    """Small reference, huge target groups: the reference term no longer
-    dominates, so without the directional target-side term the sizer would
-    return the same chunk as with lfc_threshold=None and OOM under
-    oom_recovery=False."""
+    """Small reference, huge target groups: the Phase-1 target tile dominates,
+    and the sizer budgets it EVEN WITH NO FEATURE ACTIVE.
+
+    Before the 2026-08 ultrareview the target term was gated on
+    ``n_combos or n_levels``, so this shape returned 18496 in the base case --
+    the whole gene axis, a chunk far too large for Phase 1 -- and paid an OOM
+    downshift (or, under oom_recovery=False, an outright OOM). 384 is the point
+    of that fix, not a regression.
+    """
     kw = dict(free_bytes=40 * 1024**3, budget_n=2_000, n_groups=8,
               mean_calc="arithmetic", n_genes=18_500, ref_mode=True,
               max_group_rows=200_000)
     base = _auto_gene_chunk_size(**kw, n_combos=0)
     with_grid = _auto_gene_chunk_size(**kw, n_combos=6)
     assert base == _auto_gene_chunk_size(**kw)        # defaults are a no-op
-    assert base == 18496 and with_grid == 192         # from the formula
-    assert with_grid < base
+    assert base == 384 and with_grid == 192           # from the formula
+    assert with_grid < base                          # the grid adds tiles
+    # The un-gating is what moved `base`: the same shape with an UNKNOWN tile
+    # height (max_group_rows=0, i.e. cell_source_de) is deliberately unchanged
+    # and still returns the whole gene axis.
+    assert _auto_gene_chunk_size(**{**kw, "max_group_rows": 0}, n_combos=0) == 18496
 
 
 def test_target_and_inmem_tile_constants_agree():
