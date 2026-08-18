@@ -26,4 +26,4 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126
-      - "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.7.0"
+      - "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.8.0"

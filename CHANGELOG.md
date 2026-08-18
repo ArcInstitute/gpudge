@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-18
+
+### Added
+
+- **A runnable quickstart** — `docs/tutorial.md` and `examples/quickstart.py`, over a
+  committed 4.99 MB subset of the Virtual Cell Challenge 2025 H1 training data
+  (`docs/data/`, CC0 1.0, with provenance and a sha256 recorded in `docs/data/README.md`
+  and gated by a test). It runs on real cells straight from a clone instead of a
+  synthetic fixture; `docs/make_tutorial_data.py` regenerates the subset.
+
+  The numbers the tutorial publishes are **gated, not transcribed**.
+  `tests/test_tutorial.py` recomputes them from an independent SciPy CPU oracle —
+  deliberately not written with gpudge, because an oracle that shares the
+  implementation cannot catch the implementation drifting — and fails if the prose, the
+  example's constants and `de()` ever disagree. Its own NaN-p-value branch, which the
+  committed subset never reaches, is driven by injected p-values rather than left
+  unexecuted. `examples/` joins the CI lint path.
+
 ### Fixed
 
 Eight defects from the 2026-08 whole-codebase ultrareview (8 subsystem reviewers
@@ -1018,12 +1036,13 @@ ULP of the CPU baseline on every assertable column.
   until shardad v0.3 lands an on-GPU read path.
 
 <!-- Compare links resolve against this repository, which is published as
-     milestone snapshots: 0.1.0, 0.2.0, 0.3.0, 0.3.1 and 0.7.0 are tagged here.
-     The versions between them are documented above but are not separately
+     milestone snapshots: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.7.0 and 0.8.0 are tagged
+     here. The versions between them are documented above but are not separately
      tagged here, so they carry no compare link. Issue and PR numbers throughout
      refer to the development repository. -->
 
-[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ArcInstitute/gpudge/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ArcInstitute/gpudge/compare/v0.3.1...v0.7.0
 [0.3.1]: https://github.com/ArcInstitute/gpudge/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ArcInstitute/gpudge/compare/v0.2.0...v0.3.0
