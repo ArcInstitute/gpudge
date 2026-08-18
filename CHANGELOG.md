@@ -70,7 +70,8 @@ H100, and 3 were refuted and are not listed here).
   now also happens **only when `ensure_csr` actually returned a different
   object**, so an already-CSR input no longer pays a pointless
   O(n_obs × n_var) sparse scatter.
-- **`densify_input=True` now raises on an AnnData view** instead of paying the
+- **`densify_input=True` now raises on a *sparse* AnnData view** (a view whose
+  `.X` is already dense has nothing to densify and is untouched) instead of paying the
   full dense allocation (~310 GB peak at CCL_2 scale) and discarding it, having
   already warned that the caller's matrix was mutated. Pass `adata.copy()`.
 - **Cell- and shard-layout streaming reject unassigned cells.** A cell with a

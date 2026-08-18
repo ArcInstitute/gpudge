@@ -54,9 +54,9 @@ except PackageNotFoundError:
 if not HAS_NUMBA:
     warnings.warn(
         "gpudge: numba is not installed; falling back to scipy "
-        "for sparse CSR row slicing (~3x slower on CCL_2-scale inputs). "
-        "Install with `pip install gpudge[fast]` (or "
-        "`uv sync --extra fast`) to enable the numba kernel.",
+        "for sparse CSR row slicing (~3x slower on multi-million-cell "
+        "inputs). Install with `pip install gpudge[fast]` (or "
+        "`uv pip install -e \".[fast]\"`) to enable the numba kernel.",
         stacklevel=2,
     )
 
@@ -256,7 +256,8 @@ def de(
         label and ``ALL_OTHERS`` are both rejected, since there is no obs
         column to resolve them against. An AnnData reference must have
         ``var_names`` equal to ``var_names`` element-for-element. ``groupby``
-        is unused: the source decides the grouping.
+        must be omitted -- passing it raises, since the source decides the
+        grouping.
 
         **May be called more than once**, and must yield the same groups each
         time. Nothing calls it twice today, but the contract reserves it so
@@ -282,8 +283,11 @@ def de(
     var_names : Sequence[str]
         The gene axis, shared by every yielded group and by ``reference``. The
         gene count is ``len(var_names)``. Used only with ``cell_source``.
-    groupby : str
+    groupby : str | None
         Column in ``adata.obs`` that defines the groups (e.g. guide identity).
+        Required with ``adata``; resolved from the manifest with ``archive``;
+        must be omitted with ``cell_source`` (passing it raises), which carries
+        its group labels on the yielded ``CellGroup``s instead.
     reference : str | anndata.AnnData | numpy.ndarray | scipy.sparse matrix | None
         Name of the reference group in ``adata.obs[groupby]``, OR the
         ``ALL_OTHERS`` sentinel (``"__all_others__"``) for 1-vs-rest
@@ -590,9 +594,30 @@ def de(
         the sparse first (e.g. holding both in separate variables) makes this
         slower not faster, because both representations coexist; we do the
         replacement inside de() so the rebind drops the sparse refcount to 0.
-        Not supported together with an AnnData ``reference=`` (raises
-        ``ValueError``); the external reference is ranked resident on the GPU,
-        not densified in place.
+
+        **Rejected on a sparse ``AnnData`` view.** Assigning to a view's ``.X``
+        writes through to the parent instead of rebinding, so the dense array
+        would be built, scattered into the parent and then discarded -- the
+        caller pays the full allocation and the chunk loop still takes the
+        sparse branch. ``de()`` raises ``ValueError`` at a preflight rather than
+        burn the memory; pass ``adata.copy()`` (or ``adata.to_memory()``). A
+        view whose ``.X`` is already dense is unaffected -- there is nothing to
+        densify, so it is a no-op.
+
+        Which mode you are in decides all of this, and ``cell_source`` wins over
+        the reference type:
+
+        * ``adata`` + a group label or ``ALL_OTHERS`` -- everything above: a
+          materialized sparse ``X`` is densified in place with the warning, a
+          sparse view raises, an already-dense ``X`` is a no-op.
+        * ``adata`` + ``reference=<AnnData>`` -- raises, whatever ``adata.X``
+          is: the external reference is ranked resident on the GPU rather than
+          densified in place.
+        * ``archive`` -- raises. gpudge is streaming, not holding a matrix.
+        * ``cell_source`` -- **ignored**, including when the pool it is given is
+          an ``AnnData``. That branch returns early from ``de()`` before the
+          reference-type guards are reached, so nothing raises; gpudge is not the
+          one fetching the cells.
     cpm_normalize : bool, default False
         If True, normalize each cell to 1e6 total counts on the fly, inside
         the chunk loop. Row sums are computed once over the full X before
@@ -669,8 +694,15 @@ def de(
         importable, cupy's pools) to the CUDA driver on exit, so a same-process
         caller can allocate GPU memory after de() (otherwise the pools hold ~all
         of VRAM and the caller's next cudaMalloc / cuBLAS op can OOM). Pass
-        ``False`` to keep the caches resident (avoids re-allocating the resident
-        reference when calling de() repeatedly in a tight loop). ``gpudge_arc#76``.
+        ``False`` to keep the caches resident, so a tight loop of de() calls
+        re-uses a warm allocator instead of going back to the driver.
+        **That only holds for the plain in-memory path.** All three
+        external-reference paths (streaming, in-memory ``reference=<AnnData>``,
+        and ``cell_source``) trim both allocators at their reference-residency
+        guard before reading free VRAM, because cached-but-unused blocks from an
+        earlier de() made that hard guard refuse references that fit. So under
+        ``release_gpu_memory=False`` those paths still start each call cold.
+        ``gpudge_arc#76``.
 
     Returns
     -------
@@ -1133,8 +1165,7 @@ def de(
     # caller's CSC/COO refcount so only one sparse encoding is live, and
     # densify_input then frees that too. Holding a local CSR copy instead would
     # keep BOTH encodings resident for the whole run and can turn a large
-    # supported CSC input into a host OOM (spec
-    # docs/superpowers/specs/2026-07-02-noncsr-sparse-coerce-csr-design.md).
+    # supported CSC input into a host OOM.
     #
     # VIEW: rebinding is impossible. ``view.X = ...`` writes the value back
     # THROUGH into the parent and re-reads the parent slice, so the coercion

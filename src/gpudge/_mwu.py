@@ -23,8 +23,9 @@ from ._taustar import TAUSTAR_SE_COLUMNS, TAUSTAR_SE_LEVEL
 SQRT2 = math.sqrt(2.0)
 
 # Tie-term scratch budget (elements): _tie_term_per_gene processes genes in
-# blocks of `_TIE_BLOCK_ELEMS // k` so the O(block x k) int64 run_id + f64 ones
-# scratch stays bounded for a wide reference pool. Exposed as a module constant
+# blocks of `_TIE_BLOCK_ELEMS // k` so the O(block x k) int64 run_id and the
+# `acc_dtype` (int64, or f64 past the exact bound) ones scratch stay bounded for
+# a wide reference pool. Exposed as a module constant
 # so tests can force the multi-block path (otherwise block >= n_genes). (L10)
 _TIE_BLOCK_ELEMS = 64_000_000
 

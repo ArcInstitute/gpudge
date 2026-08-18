@@ -87,9 +87,10 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
   `pytest.importorskip("shardad")`) are not collected at all.
 
   Counts, measured 2026-08-18 — do not propagate them without re-measuring. This
-  tree with **no** GPU reports **537 passed / 188 skipped**, and its CI reports
-  **469 passed / 120 skipped** — 116 CUDA-gated cases, the 3 module-level shardad
-  skips, and the one real-data test. The three shardad suites hold **139 cases,
+  tree with **no** GPU reports **537 passed / 188 skipped** (725 collected), and
+  its CI reports **469 passed / 120 skipped** — 116 CUDA-gated cases, the 3
+  module-level shardad skips, and the one real-data test. The three shardad
+  suites hold **139 cases,
   68 of which need no GPU at all** (33 + 35 + 0 pass on a GPU-less host), so what
   CI misses there is not only GPU coverage. A GPU run has to hard-fail when torch
   cannot see a GPU, or when shardad/numba are absent — otherwise those tests
@@ -143,5 +144,10 @@ of [pdex](https://github.com/ArcInstitute/pdex) the Arc VCI pipeline uses.
   once (spec §3.2b). All mixed-dtype comparisons go through `_mwu._bounds`;
   a raw `torch.searchsorted` with an f32 boundary and f64 values upcasts and
   copies the whole reference (0.05 ms → 65.26 ms on a 160 MB reference).
-- `densify_input=True` mutates `adata.X` in place and emits a `UserWarning`.
-  Pass `adata.copy()` first if you need to preserve the sparse matrix.
+- `densify_input=True` mutates a **materialized sparse** `adata.X` in place and
+  emits a `UserWarning`; pass `adata.copy()` first if you need the sparse matrix
+  preserved. An already-dense `X` is a no-op — nothing is mutated and nothing is
+  warned. Honoured on the in-memory group-label / `ALL_OTHERS` path ONLY: a
+  sparse view raises, and so do `archive=` and `adata=` + `reference=<AnnData>`.
+  `cell_source=` **ignores** it — that branch returns before the reference-type
+  guard, so even a `cell_source=` + AnnData-pool call does NOT raise.

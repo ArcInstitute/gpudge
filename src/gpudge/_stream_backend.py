@@ -55,9 +55,11 @@ def _import_shardad():
         import shardad
     except ImportError as e:  # pragma: no cover - exercised via monkeypatch
         raise ImportError(
-            "de(archive=...) requires the optional 'streaming' extra. "
-            "Install with `pip install gpudge[streaming]` or "
-            "`uv sync --extra streaming`."
+            "de(archive=...) requires the optional 'streaming' extra, which "
+            "installs shardad. shardad is hosted privately at "
+            "ArcInstitute/shardad and is not published on PyPI, so the extra "
+            "only resolves with access to that repository -- see the Install "
+            "section of the README for the exact pin."
         ) from e
     return shardad
 

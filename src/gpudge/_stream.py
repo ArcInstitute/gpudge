@@ -118,15 +118,14 @@ def _auto_gene_chunk_size(
         per_cell_bytes = 64
         accumulator_bytes_per_gene = 8 * 3 * n_groups
     bytes_per_gene = max(budget_n * per_cell_bytes + accumulator_bytes_per_gene, 1)
-    # Phase-1 (target) peak, modelled when a tau grid or tau* is active. The
+    # Phase-1 (target) peak. The
     # reference-cell term above models the Phase-0 reference sort; Phase 1 holds
     # the RESIDENT sorted reference (budget_n f32 per gene) plus the target tile
     # and its MWU working arrays plus the device accumulators -- so it is a
     # complete peak, not just the LFC delta. CONSTANT in n_combos beyond
     # `accumulator_bytes_per_gene` (the per-combo transients are freed each
-    # iteration). Gated on either feature so `bytes_per_gene` is EXACTLY
-    # unchanged when both are inactive -- do NOT fold this into the expression
-    # above.
+    # iteration). Kept as a separate addend rather than folded into the
+    # `bytes_per_gene` expression above.
     # UN-GATED as of the 2026-08 ultrareview: modelled whenever the caller knows
     # the tile height, not only when a tau grid or tau* is active. The old
     # `if n_combos or n_levels` gate was a scope decision that kept n_combos=0
