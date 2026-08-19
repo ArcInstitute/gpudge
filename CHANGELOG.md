@@ -5,6 +5,12 @@ All notable changes to gpudge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **A note on issue and PR numbers.** References such as `#124`, `gpudge_arc#115`
+> and `shardad #246` throughout this file are **provenance, not links**: they
+> identify entries in issue trackers that are not public, and will not resolve
+> from here. They are kept so that each change can be traced back to the
+> discussion that produced it.
+
 ## [Unreleased]
 
 ## [0.8.0] — 2026-08-18
@@ -77,7 +83,7 @@ H100, and 3 were refuted and are not listed here).
   coercion.** Assigning to a view's `.X` writes through to the parent instead of
   rebinding, so the coercion vanished while its warning claimed success —
   dropping every gather tile onto scipy slicing, the regression
-  [#66](https://github.com/ArcInstitute/gpudge_arc/issues/66) added it to
+  `gpudge_arc#66` added it to
   prevent. On an already-CSR view the assignment also ran a full
   O(n_obs × n_var) sparse scatter into the caller's matrix. The coerced matrix is
   now bound to a local **for views only**. A materialized `AnnData` is still
@@ -264,7 +270,7 @@ it go red.
 ### Added
 
 - **`de(cell_source=…)` — a public bring-your-own cell source**
-  ([#86](https://github.com/ArcInstitute/gpudge_arc/issues/86)). A third input
+  (`gpudge_arc#86`). A third input
   mode, alongside `adata=` and `archive=`, taking a callable that yields one
   public `CellGroup(label, X, rows=None)` per target group plus `targets=` /
   `var_names=`. It runs the same `refpool_de_core` as the other
@@ -323,7 +329,7 @@ it go red.
   `tau_star` and `tau_star_se`.
 
 - **`de(archive=…)` reads `layout='cell'` shardad archives**
-  ([#110](https://github.com/ArcInstitute/gpudge_arc/issues/110)): streaming DE
+  (`gpudge_arc#110`): streaming DE
   now works on `.csad` per-cell archives, the form several VCI production
   datasets are written in, removing the need for a shard-layout twin of a 40+ GB
   archive. `de(shard_archive=…)` is the deprecated spelling of the new
@@ -1038,8 +1044,7 @@ ULP of the CPU baseline on every assertable column.
 <!-- Compare links resolve against this repository, which is published as
      milestone snapshots: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.7.0 and 0.8.0 are tagged
      here. The versions between them are documented above but are not separately
-     tagged here, so they carry no compare link. Issue and PR numbers throughout
-     refer to the development repository. -->
+     tagged here, so they carry no compare link. -->
 
 [Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/ArcInstitute/gpudge/compare/v0.7.0...v0.8.0

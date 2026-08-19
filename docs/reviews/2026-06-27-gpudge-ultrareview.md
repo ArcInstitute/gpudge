@@ -28,11 +28,16 @@ No live correctness bug exists in any realistic, supported code path. The core M
 
 ## Resolution status
 
-Added 2026-08-18. **All 22 findings were addressed in v0.3.1 ([#59](https://github.com/ArcInstitute/gpudge_arc/pull/59))**, the release immediately following this review; two of them deliberately by deciding no code should change. Statuses below were re-verified against the tree at `v0.8.0`, and the *Evidence* column names something you can open — a regression test that cites the finding ID, or the code that now carries the guard.
+> `gpudge_arc#59` and similar tokens below are **provenance, not links**: they
+> identify entries in an issue tracker that is not public and will not resolve
+> from here. They are kept so each disposition can be traced to the change that
+> made it.
+
+Added 2026-08-18. **All 22 findings were addressed in v0.3.1 (`gpudge_arc#59`)**, the release immediately following this review; two of them deliberately by deciding no code should change. Statuses below were re-verified against the tree at `v0.8.0`, and the *Evidence* column names something you can open — a regression test that cites the finding ID, or the code that now carries the guard.
 
 | # | Severity | Finding | Status | Evidence |
 |---|---|---|---|---|
-| H1 | High | NaN/None `groupby` labels bucketed into `'nan'`/`'None'` groups | **Fixed** (v0.3.1); guard broadened in v0.8.0 ([#124](https://github.com/ArcInstitute/gpudge_arc/pull/124)) | `_ingest.MISSING_LABEL_SPELLINGS` and the mirroring guard in `_shard_stream.py`, which was the only streaming layout when this was fixed; `_cell_stream.py` gained the same screen when the cell layout arrived in v0.7.0. ⚠️ One backend-parity gap remains open as [#127](https://github.com/ArcInstitute/gpudge_arc/issues/127) — a group *genuinely* named `nan` is rejected on streaming but accepted in memory |
+| H1 | High | NaN/None `groupby` labels bucketed into `'nan'`/`'None'` groups | **Fixed** (v0.3.1); guard broadened in v0.8.0 (`gpudge_arc#124`) | `_ingest.MISSING_LABEL_SPELLINGS` and the mirroring guard in `_shard_stream.py`, which was the only streaming layout when this was fixed; `_cell_stream.py` gained the same screen when the cell layout arrived in v0.7.0. ⚠️ One backend-parity gap remains open as `gpudge_arc#127` — a group *genuinely* named `nan` is rejected on streaming but accepted in memory |
 | M1 | Medium | MWU-vs-scipy correctness tests all `@needs_cuda` | **Fixed** | `test_mwu.py::test_mwu_ref_matches_scipy_cpu`, which cites M1 |
 | M2 | Medium | Streaming equivalence checked Pearson correlation only | **Fixed** | `test_shard_stream.py::_assert_equiv` — `allclose(rtol=1e-5, atol=1e-7, equal_nan=True)` over full row coverage, with the M2 reasoning at the call site |
 | M3 | Medium | `environment.yml` pinned `gpudge @v0.2.0` | **Fixed** | pins the current release tag; kept in step with README by a note in both |
@@ -51,7 +56,7 @@ Added 2026-08-18. **All 22 findings were addressed in v0.3.1 ([#59](https://gith
 | N2 | Nit | `.item()` forces per-chunk GPU→CPU syncs | **No change** | a perf nit with no correctness impact; the syncs are still there in `_mwu.py` |
 | N3 | Nit | A group literally named `'all_others'` is remapped | **No change, deliberate** | this review's own recommendation was "no action before the legacy spelling is removed"; the behaviour is noted in `__init__.py` |
 | N4 | Nit | `mwu_ref` sentinel test checked only the p-value half | **Fixed** | `test_mwu.py` now asserts `(U[ref_idx] == 0).all()`, citing N4 |
-| N5 | Nit | `MeanCalc` / `__version__` absent from the README API docs | **Fixed** | both documented in the README ([#126](https://github.com/ArcInstitute/gpudge_arc/pull/126)) |
+| N5 | Nit | `MeanCalc` / `__version__` absent from the README API docs | **Fixed** | both documented in the README (`gpudge_arc#126`) |
 | N6 | Nit | `csr_row_sums` docstring said "CSR" but accepts dense | **Fixed** | now "Per-row sum of a CSR sparse OR dense matrix" |
 | N7 | Nit | README/SKILL listed 5 of the 10 default output columns | **Fixed** | both now list all ten under a `columns (10):` heading |
 

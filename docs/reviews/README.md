@@ -9,6 +9,10 @@ defect from a live one without cross-referencing the changelog. A findings list
 without dispositions reads as a list of known, open bugs — the opposite of what
 publishing it is for.
 
+Issue and PR numbers on this page and in the reports — `gpudge_arc#59` and
+similar — are provenance: they identify entries in an issue tracker that is not
+public and will not resolve from here.
+
 | report | findings | disposition |
 |---|---|---|
 | [2026-06-13](2026-06-13-gpudge-ultrareview.md) | 23 survived verification, of 28 raw | status table in the report: 9 confirmed defects, 5 fixed in the same PR, 4 filed as issues |
