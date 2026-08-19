@@ -83,8 +83,6 @@ Some prose is checked by tests, and changing it means changing the test too:
   `tests/test_tutorial.py` from an independent SciPy oracle. Edit the transcript
   and the test fails.
 - The committed tutorial dataset is pinned by sha256.
-- The test counts quoted in `CLAUDE.md` are measurements. If your change moves
-  them, re-measure rather than adjusting them by hand.
 
 ## Pull requests
 
