@@ -900,7 +900,7 @@ Distribution remains **Arc-internal** — install from the `v0.3.0` git tag
   literal-reference path** — lands ~4096 on A100-40GB/CCL_2, the bench-measured
   throughput knee. Measured `de()` speedup (result-invariant): **~7% on
   A100-40GB** (GCP sweep `20260530T012835Z`, where 0.18 under-sizes to ~3712)
-  and **~3% on H100-80GB** (slurm: 47.6s → 46.2s, chunk 8256 → 9152); neutral /
+  and **~3% on H100-80GB** (47.6s → 46.2s, chunk 8256 → 9152); neutral /
   no regression on larger GPUs (the curve is flat past the knee). Still scales
   inversely with the reference-pool size. The `ALL_OTHERS` path now uses 0.20
   as well, once #28 gave it the same OOM-recovery backstop. (#22, #28)

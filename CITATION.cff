@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use gpudge in your research, please cite it as below."
+title: "gpudge: GPU Mann-Whitney differential expression for single-cell CRISPR screens"
+abstract: >-
+  A GPU-only Mann-Whitney U differential expression library for single-cell
+  CRISPR perturbation screens. One entry point, de(), taking an in-memory
+  AnnData, a separate control AnnData, a caller-supplied cell source, or a
+  streamed shardad archive. Two-sided asymptotic Mann-Whitney with tie and
+  continuity corrections, matching scipy.stats.mannwhitneyu, with per-group
+  Benjamini-Hochberg adjustment and rank-based effect sizes.
+type: software
+authors:
+  - family-names: Dobin
+    given-names: Alexander
+    affiliation: "Arc Institute"
+version: 0.8.0
+date-released: "2026-08-18"
+license: MIT
+repository-code: "https://github.com/ArcInstitute/gpudge"
+keywords:
+  - single-cell
+  - differential-expression
+  - mann-whitney
+  - wilcoxon
+  - CRISPR
+  - perturbation-screen
+  - GPU
+  - CUDA
