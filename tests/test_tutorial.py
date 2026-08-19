@@ -6,7 +6,7 @@ CPU in about a second. So the tutorial's transcript is checked against an **inde
 oracle** rather than against gpudge's own output -- which means these gates run in CI,
 without a GPU, and would catch both a stale transcript and a regression in `de()`.
 
-That matters more than it sounds: the CI-coverage figures in CLAUDE.md went stale three
+That matters more than it sounds: this project's CI-coverage figures went stale three
 times in three days because nothing asserted them. A tutorial is worse, because a reader
 takes its numbers on trust.
 """

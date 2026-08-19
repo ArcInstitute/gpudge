@@ -211,9 +211,10 @@ that blurred the two would be worth less than none.
 - **Fix:** Reword the summary to "Per-row sum of a CSR sparse OR dense matrix".
 
 #### N7. README/SKILL streaming usage comment lists only 5 of the 10 default output columns
-- **File:** `README.md:156` and `gpudge-usage/SKILL.md` (finding cites `_shard_stream.py:391-407` as the code anchor — the code is correct; the defect is in the docs comments)
+- **File:** `README.md:156` and the then-shipped `gpudge-usage` reference
+  skill (finding cites `_shard_stream.py:391-407` as the code anchor — the code is correct; the defect is in the docs comments)
 - **Lenses:** docs
-- The default frame has 10 columns (`DEFAULT_OUTPUT_COLUMNS`, `_output.py:8-14`), but the no-`output_columns` example annotates `# columns: target, feature, log2_fold_change, p_value, p_adj` (5, no "…" qualifier); SKILL.md repeats it. A subset listing, so non-misleading on what's present but incomplete. (The title's "no-reference warning relaxation" sub-claim is unsupported; only the column-count issue holds.)
+- The default frame has 10 columns (`DEFAULT_OUTPUT_COLUMNS`, `_output.py:8-14`), but the no-`output_columns` example annotates `# columns: target, feature, log2_fold_change, p_value, p_adj` (5, no "…" qualifier); the usage skill repeated it. A subset listing, so non-misleading on what's present but incomplete. (The title's "no-reference warning relaxation" sub-claim is unsupported; only the column-count issue holds.)
 - **Fix:** List all 10 default columns or add "(among others)"/"…", or make the example actually pass `output_columns={...}` for those 5.
 
 ---

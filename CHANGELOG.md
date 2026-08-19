@@ -867,7 +867,7 @@ Distribution remains **Arc-internal** — install from the `v0.3.0` git tag
 ### Docs / Tooling
 
 - `docs/THIRD_PARTY_LICENSES.md` — third-party license audit. (#38)
-- `gpudge-usage` reference skill (`.claude/skills/gpudge-usage/`) — install +
+- `gpudge-usage` reference skill — install +
   `de()` usage guide covering pip/uv/conda + extras, one-vs-rest (`ALL_OTHERS`),
   shardad archive streaming, CPM / library-size normalization, and the opt-in
   per-gene filters. (#55)
