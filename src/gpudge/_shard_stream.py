@@ -36,9 +36,9 @@ def _cupy_available() -> bool:
 
 
 def _x_cupy_available() -> bool:
-    """True iff the installed shardad exposes GroupShard.x_cupy (>= 0.5.5)."""
+    """True iff the installed cellstream exposes GroupShard.x_cupy (>= 0.5.5)."""
     try:
-        from shardad.read import GroupShard
+        from cellstream.read import GroupShard
     except Exception:
         return False
     return hasattr(GroupShard, "x_cupy")
@@ -46,12 +46,12 @@ def _x_cupy_available() -> bool:
 
 def _should_device_decode(arch) -> bool:
     """Device GPU decode (x_cupy) is available iff the archive is x_cupy-capable
-    (not v1), cupy is importable, and the installed shardad exposes
+    (not v1), cupy is importable, and the installed cellstream exposes
     GroupShard.x_cupy. Otherwise the caller falls back to the CPU-parallel
     prefetch path (iter_group_shards + gs.x()).
 
     x_cupy raises only for v1 archives; it works for both the **v0.5.x single-file
-    packed** container (``schema_version == 3`` — the current/default shardad
+    packed** container (``schema_version == 3`` — the current/default cellstream
     format) and legacy v2-directory archives (``schema_version == 2``). Checking
     only ``== 2`` was a bug: real packed archives (3) silently fell back to host,
     so device decode never engaged in production. v1 (``schema_version == 1``) is
@@ -73,7 +73,7 @@ def _resolve_streaming(backend, groupby, reference):
     if arch_groupby is None:
         raise ValueError(
             "archive was not written with a group_by key (not target-aware). "
-            "Re-write with shardad.write_sharded(..., group_by=<obs column>)."
+            "Re-write with cellstream.write_sharded(..., group_by=<obs column>)."
         )
     if groupby is not None and groupby != arch_groupby:
         raise ValueError(
@@ -118,7 +118,7 @@ def _resolve_streaming(backend, groupby, reference):
         raise ValueError(
             "archive has no reference. Either supply an external pool via "
             "reference=<AnnData>, or re-write the archive with "
-            "shardad.write_sharded(..., reference=<label(s)>)."
+            "cellstream.write_sharded(..., reference=<label(s)>)."
         )
     ref_X, msg_label = backend.resolve_archive_reference(groupby, reference)
     return groupby, "archive_ref", ref_X, msg_label
@@ -134,7 +134,7 @@ def _iter_kwargs(n_workers, prefetch):
     fallback.
 
     ``prefetch <= 0`` → ``{}`` (serial; the bare call is byte-identical to
-    pre-prefetch shardad — the low-host-RAM fallback). ``prefetch >= 1`` →
+    pre-prefetch cellstream — the low-host-RAM fallback). ``prefetch >= 1`` →
     decode ``prefetch`` shards ahead with ``n_workers``-way parallel decode,
     overlapping shard decode with GPU compute.
 
@@ -178,7 +178,7 @@ class _ShardBackend:
     """``layout='shard'`` backend -- the pre-#110 streaming driver, unchanged.
 
     LEGACY. Shard layout is slated for deprecation; removing it is deleting
-    this class and this module's shardad dependency.
+    this class and this module's cellstream dependency.
 
     Every decode/reference expression here is lifted from the pre-#110
     ``stream_de``/``_resolve_streaming`` unchanged, so the shard path's OUTPUT
@@ -497,7 +497,7 @@ def stream_de(archive, *, groupby, reference, mean_calc, epsilon,
     if not np.isfinite(epsilon) or epsilon < 0:
         raise ValueError(f"epsilon must be a finite value >= 0, got {epsilon!r}.")
     # Mirror de()'s guard so a direct stream_de() call also fails fast (and never
-    # feeds a bad value to _iter_kwargs / shardad).
+    # feeds a bad value to _iter_kwargs / cellstream).
     for _name, _val in (("stream_n_workers", stream_n_workers),
                         ("stream_prefetch", stream_prefetch)):
         if not isinstance(_val, (int, np.integer)) or isinstance(_val, bool):

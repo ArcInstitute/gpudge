@@ -26,12 +26,13 @@ git clone https://github.com/ArcInstitute/gpudge.git && cd gpudge
 uv venv && uv pip install --torch-backend=cu126 -e ".[dev,fast]"
 ```
 
-Use `uv pip install`, **not `uv sync`** — `uv sync` builds uv's universal lock,
-which resolves every entry in `[tool.uv.sources]`, including the private
-`shardad` source, even when you did not ask for the `streaming` extra; without
-SSH access to that repository it fails with `Permission denied (publickey)`.
-`uv pip install` resolves only the extras you name. `[fast]` adds numba, which
-the fast CSR kernel needs; `[dev]` adds pytest, ruff, scanpy and pyyaml.
+`uv pip install` resolves only the extras you name, and skips
+`[tool.uv.sources]` — which is why `--torch-backend=cu126` is passed explicitly.
+`uv sync` also works now; it did not before the `shardad` → `cellstream` rename,
+because `[tool.uv.sources]` then carried a private git-SSH entry that `uv sync`
+resolved even when the `streaming` extra was not requested, failing with
+`Permission denied (publickey)` for anyone without a key. `[fast]` adds numba,
+which the fast CSR kernel needs; `[dev]` adds pytest, ruff, scanpy and pyyaml.
 
 ## Running the tests
 
@@ -54,7 +55,7 @@ Two things that surprise people:
   CUDA host, and what it reported.
 
 Three suites (`test_shard_stream.py`, `test_cell_stream.py`,
-`test_inmem_external_ref_gpu.py`) call `importorskip("shardad")` at module
+`test_inmem_external_ref_gpu.py`) call `importorskip("cellstream")` at module
 level, so without that optional dependency they are not collected at all — they
 appear as 3 skips rather than as their real case count.
 

@@ -67,15 +67,19 @@ def _plan_batches(ranges, *, bytes_per_row, target_bytes=None):
 def _cell_group_ranges(store):
     """``(reference_labels | None, [(label, start, stop), ...])`` for a CellStore.
 
-    Reads shardad's **private** ``CellStore._load_groups()``. Deliberate: the
-    group table is exact, needs no I/O and no RAM, while the only public route
-    to it (run detection over ``store.obs[group_by]``) would load the whole obs
-    DataFrame -- 36 columns x 1.27 M rows on a production archive -- just to
-    recover a table the archive already stores. An upstream ask is filed for a
-    public ``group_ranges()``; ``test_cell_group_ranges_private_api_gone`` makes
+    Reads cellstream's **private** ``CellStore._load_groups()``. That upstream
+    ask has since been answered: cellstream 0.8.0 added public
+    ``CellStore.group_spans()`` (a list of ``GroupSpan(label, start, stop)``) and
+    ``CellStore.reference_row_count()``, which give exactly this table without
+    loading obs. Migrating to them is tracked separately and is a cleanup, not a
+    fix -- the private call still exists in the pinned 0.9.0 and the suites pass
+    against it. Until then the reasoning below is history, not a live claim: run-detection
+    over ``store.obs[group_by]`` would load the whole obs DataFrame --
+    36 columns x 1.27 M rows on a production archive -- to recover a table the
+    archive already stores, which is why the private reach-in was taken; ``test_cell_group_ranges_private_api_gone`` makes
     its removal fail loudly rather than silently.
 
-    Validates what shardad's own ``read_reference()`` silently assumes: the
+    Validates what cellstream's own ``read_reference()`` silently assumes: the
     reference groups lead contiguously from row 0, so its ``[0, max stop)``
     gather cannot pull target cells into the reference pool.
     """
@@ -90,10 +94,10 @@ def _cell_group_ranges(store):
         ranges = [(str(g["label"]), int(g["start"]), int(g["stop"])) for g in raw]
     except (AttributeError, KeyError, TypeError, ValueError) as e:
         raise RuntimeError(
-            f"gpudge cannot read the group table of {store.path}: shardad's "
+            f"gpudge cannot read the group table of {store.path}: cellstream's "
             f"private CellStore._load_groups() did not return the expected "
             f"{{'reference': ..., 'groups': [...]}} shape. gpudge pins "
-            f"shardad>=0.7.1; see gpudge _cell_stream._cell_group_ranges."
+            f"cellstream>=0.9.0; see gpudge _cell_stream._cell_group_ranges."
         ) from e
 
     if not ranges:
@@ -110,7 +114,7 @@ def _cell_group_ranges(store):
             f"{store.path}: duplicate group labels {sorted(dup)} in the group table."
         )
     # An unassigned cell reaches the archive as a group literally named 'nan'
-    # (shardad stringifies the obs column at write time), which the in-memory
+    # (cellstream stringifies the obs column at write time), which the in-memory
     # path refuses at _ingest.py's source-level guard. Screen the strings here so
     # the two paths agree instead of streaming a bogus perturbation block.
     # Reading store.obs[group_by] to test isna() is exactly the whole-obs load
@@ -148,7 +152,7 @@ def _cell_group_ranges(store):
     if lead != set(ref_labels):
         raise ValueError(
             f"{store.path}: reference labels {sorted(ref_labels)} are not the "
-            f"leading groups (rows from 0 start with {sorted(lead)}). shardad's "
+            f"leading groups (rows from 0 start with {sorted(lead)}). cellstream's "
             f"read_reference() gathers [0, max reference stop), so a non-leading "
             f"reference block would silently include target cells in the "
             f"reference pool."
@@ -173,7 +177,7 @@ class _CellBackend:
         self.n_vars = int(store.n_vars)
         self.var_names = np.asarray(store.var.index)
         self.group_by = man.get("group_by")
-        # No x_cupy equivalent exists for the cell codec anywhere in shardad;
+        # No x_cupy equivalent exists for the cell codec anywhere in cellstream;
         # stated rather than inferred from a missing schema_version attribute.
         self.supports_device_decode = False
 
@@ -209,7 +213,7 @@ class _CellBackend:
 
     def close(self):
         # Close FIRST, clear only on success. CellStore.close() raises
-        # BufferError while an mmap view is still exported (shardad
+        # BufferError while an mmap view is still exported (cellstream
         # cell/reader.py); clearing the attribute first would throw away the
         # only handle that could retry, leaking the mapping.
         if self._store is not None:
@@ -241,7 +245,7 @@ class _CellBackend:
             raise ValueError(
                 "archive has no reference. Either supply an external pool via "
                 "reference=<AnnData>, or re-write the archive with "
-                "shardad.write_sharded(..., reference=<label(s)>)."
+                "cellstream.write_sharded(..., reference=<label(s)>)."
             )
         msg_label = validate_archive_reference(reference, labels)
         ref_X = self._gather(0, self._ref_stop)

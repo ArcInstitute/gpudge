@@ -279,7 +279,7 @@ def _accumulate_target_group(
 
     # Legacy path (streaming host-CSR + device-cupy sources): unchanged.
     # Pick the densify backend ONCE per group (X_source is fixed across this
-    # group's gene-chunks): device cupy CSR (shardad x_cupy — on-device densify,
+    # group's gene-chunks): device cupy CSR (cellstream x_cupy — on-device densify,
     # zero-copy to torch, no H2D) vs host scipy CSR (numba densify + H2D). Keeps
     # the per-gene-chunk hot loop free of a repeated predicate + module import.
     if is_cupy_csr(X_source):

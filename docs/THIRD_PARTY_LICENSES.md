@@ -45,6 +45,15 @@ licensed `MIT`** (see `LICENSE` and `pyproject.toml`).
 > Supersedes the 2026-07-25 audit, which was taken against the developer `.venv`
 > and therefore recorded a `shardad` version predating the `[cell]` extra entirely,
 > and omitted `pyfastpfor` and `pybind11` (`gpudge_arc#120`).
+>
+> ⚠️ **The `shardad` row below is stale as of `gpudge_arc#139`.** That package has
+> been renamed **`cellstream`**, is published on PyPI, and the `streaming` extras
+> now pin `cellstream>=0.9.0` — so the private-repo access this recipe
+> describes is no longer needed, and `[tool.uv.sources]` no longer carries a
+> git-SSH entry for it. Everything below is left exactly as it was measured on
+> the date in the banner: this file is a dated record, and the correct fix is to
+> re-run the regeneration recipe against the new dependency rather than to edit
+> the recorded rows by hand.
 
 ## How to regenerate
 

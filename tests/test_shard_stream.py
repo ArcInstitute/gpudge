@@ -10,11 +10,11 @@ from gpudge import ALL_OTHERS, _shard_stream as ss
 from gpudge._mwu import mwu_one_group, _tie_term_per_gene
 from conftest import LFC_TAUS, _make_synth, needs_cuda   # synth generator + cuda marker
 
-# NOTE: shardad-free tests (the pure _iter_kwargs helper, de()-level
+# NOTE: cellstream-free tests (the pure _iter_kwargs helper, de()-level
 # stream_n_workers/stream_prefetch guards) live in test_api.py — the module-level
-# pytest.importorskip("shardad")
+# pytest.importorskip("cellstream")
 # below skips this WHOLE module (incl. anything above it) when the streaming extra
-# is absent, so those would get no shardad-less CPU-CI coverage here.
+# is absent, so those would get no cellstream-less CPU-CI coverage here.
 
 
 def test_neither_adata_nor_archive_raises():
@@ -87,13 +87,13 @@ def test_unknown_output_columns_with_archive_raises():
 # ---------------------------------------------------------------------------
 # Task-2: archive fixtures + _resolve_streaming tests
 # ---------------------------------------------------------------------------
-# shardad is the optional [streaming] extra; skip the whole streaming-test
+# cellstream is the optional [streaming] extra; skip the whole streaming-test
 # module cleanly when it isn't installed instead of erroring at collection.
-shardad = pytest.importorskip("shardad", reason="requires gpudge[streaming]")
+cellstream = pytest.importorskip("cellstream", reason="requires gpudge[streaming]")
 
 
 def _write_archive(adata, path, *, group_by, reference, target_shard_bytes):
-    shardad.write_sharded(
+    cellstream.write_sharded(
         adata, str(path), format="v2",
         group_by=group_by, reference=reference,
         target_shard_bytes=target_shard_bytes,
@@ -137,14 +137,14 @@ def test_resolve_mode1_basic(archive_mode1):
 
 def test_should_device_decode_true_on_real_packed_archive(archive_mode1, monkeypatch):
     """Regression for the schema_version-3 selector bug: a real v0.5.x archive
-    written by shardad.write_sharded is a single-file **packed** container with
+    written by cellstream.write_sharded is a single-file **packed** container with
     ``schema_version == 3``. The selector previously checked ``== 2``, so device
     decode silently fell back to host in production (the bit-parity gate missed it
     because it monkeypatches ``_should_device_decode``). This exercises the
     NATURAL selector on a real packed archive; cupy/x_cupy are monkeypatched so it
-    runs wherever shardad is installed, no GPU needed."""
+    runs wherever cellstream is installed, no GPU needed."""
     d, _ = archive_mode1
-    arch = shardad.ShardedArchive(d)
+    arch = cellstream.ShardedArchive(d)
     assert arch.schema_version == 3                        # v0.5.x packed container
     monkeypatch.setattr(ss, "_cupy_available", lambda: True)
     monkeypatch.setattr(ss, "_x_cupy_available", lambda: True)
@@ -250,7 +250,7 @@ def test_external_pool_ignores_archive_reference_shard(archive_ref_and_noref):
 def test_resolve_non_grouped_archive_raises(tmp_path):
     from gpudge._stream_backend import open_backend
     adata = _make_synth(n_cells=200, n_genes=20, n_guides=4, sparse=True)
-    shardad.write_sharded(adata, str(tmp_path / "ng"), format="v2")  # no group_by
+    cellstream.write_sharded(adata, str(tmp_path / "ng"), format="v2")  # no group_by
     b = open_backend(str(tmp_path / "ng"), n_workers=2, prefetch=0)
     with pytest.raises(ValueError, match="group_by"):
         ss._resolve_streaming(b, None, None)
@@ -288,7 +288,7 @@ def test_open_backend_shard(archive_mode1):
     d, adata = archive_mode1
     b = open_backend(d, n_workers=2, prefetch=0)
     try:
-        arch = shardad.ShardedArchive(d)
+        arch = cellstream.ShardedArchive(d)
         assert b.n_vars == arch.n_vars
         assert np.array_equal(b.var_names, np.asarray(arch.var.index))
         assert b.group_by == "comparison"
@@ -392,7 +392,7 @@ def host_decode(monkeypatch):
 
     _should_device_decode is True whenever cupy merely *imports* -- and cupy is
     importable on CPU boxes that have no usable CUDA driver, where gs.x_cupy()
-    then dies inside shardad's nvcomp codec. The tests below are about the host
+    then dies inside cellstream's nvcomp codec. The tests below are about the host
     path's I/O structure, so they pin it explicitly instead of depending on
     whether the machine happens to have cupy installed. (The device path has its
     own needs_cuda-gated parity tests further down.)"""
@@ -406,7 +406,7 @@ def test_shard_backend_target_row_sums_matches_manual(archive_mode1, host_decode
     d, _ = archive_mode1
     b = open_backend(d, n_workers=2, prefetch=0)
     try:
-        arch = shardad.ShardedArchive(d)
+        arch = cellstream.ShardedArchive(d)
         manual = np.concatenate(
             [csr_row_sums(gs.x()) for gs in arch.iter_group_shards()])
         np.testing.assert_array_equal(b.target_row_sums(), manual)
@@ -442,13 +442,13 @@ def test_shard_backend_iterates_shards_the_expected_number_of_times(
                          ids=["lazy", "prefetch"])
 def test_group_shard_x_byte_identical_to_to_anndata(archive_mode1, iter_kw):
     """The streaming hot loop reads shard matrices via gs.x() (raw CSR, no
-    AnnData wrapper). shardad guarantees gs.x() is byte-identical to
+    AnnData wrapper). cellstream guarantees gs.x() is byte-identical to
     gs.to_anndata().X; guard it here on the real reader (no GPU needed) so a
     regression in the swap surfaces on CPU. Covers both the lazy (prefetch=0)
     and decode-ahead (prefetch>=1) paths, since x() resolves differently in
     each."""
     d, _ = archive_mode1
-    arch = shardad.ShardedArchive(d)
+    arch = cellstream.ShardedArchive(d)
     n_shards = 0
     for gs in arch.iter_group_shards(**iter_kw):
         X = gs.x()                               # what stream_de() consumes
@@ -731,17 +731,17 @@ def test_stream_empty_targets_respects_output_columns(tmp_path):
     assert df.schema["p"] == pl.Float64
 
 
-def test_missing_shardad_import_message(monkeypatch):
+def test_missing_cellstream_import_message(monkeypatch):
     import builtins
-    from gpudge._stream_backend import _import_shardad
+    from gpudge._stream_backend import _import_cellstream
     real_import = builtins.__import__
     def fake(name, *a, **k):
-        if name == "shardad":
-            raise ImportError("no shardad")
+        if name == "cellstream":
+            raise ImportError("no cellstream")
         return real_import(name, *a, **k)
     monkeypatch.setattr(builtins, "__import__", fake)
     with pytest.raises(ImportError, match="streaming"):
-        _import_shardad()
+        _import_cellstream()
 
 
 def test_resolve_mode1_reference_read_none_raises(archive_mode1, monkeypatch):
@@ -757,7 +757,7 @@ def test_resolve_mode1_reference_read_none_raises(archive_mode1, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # #69 MERGE GATE: device (x_cupy) decode == host CSR decode, byte-for-byte.
-# Forces each path via _should_device_decode; needs shardad>=0.5.5 (x_cupy) in
+# Forces each path via _should_device_decode; needs cellstream>=0.5.5 (x_cupy) in
 # the env for the device leg (see the plan's Phase-6 GPU prerequisite).
 # ---------------------------------------------------------------------------
 @needs_cuda
@@ -1018,7 +1018,7 @@ def test_stream_empty_targets_with_lfc_grid(archive_mode1, tmp_path):
 
 
 # --- tau_star over the streaming paths -----------------------------------
-# CI is CPU-only and does not even COLLECT this module (it needs shardad), so
+# CI is CPU-only and does not even COLLECT this module (it needs cellstream), so
 # these run only on a GPU host with shardad installed. That is precisely why they
 # exist: the tau* accumulators are threaded differently on each path
 # (`__init__.py` carries a reference row and drops it via target_indices;

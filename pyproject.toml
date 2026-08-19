@@ -1,6 +1,6 @@
 [project]
 name = "gpudge"
-version = "0.8.0"
+version = "0.9.0"
 description = "Lightweight GPU-only Mann–Whitney U differential expression."
 readme = "README.md"
 authors = [{ name = "Arc Institute" }]
@@ -58,21 +58,27 @@ Issues = "https://github.com/ArcInstitute/gpudge/issues"
 # require.
 dev = ["pytest>=8", "ruff>=0.6,<0.16", "scanpy>=1.11", "pyyaml>=6"]
 fast = ["numba>=0.59"]
-# Optional: streaming a shardad archive directly (de(archive=...)).
-# The core library takes an in-memory AnnData and does NOT need shardad.
+# Optional: streaming a cellstream archive directly (de(archive=...)).
+# The core library takes an in-memory AnnData and does NOT need cellstream.
 # `streaming` is the CPU-friendly base: pulls no CUDA-only wheels onto host-only
-# / CPU-CI installs. Floor >=0.7.1 -- layout='cell' first shipped in v0.6.0, but
-# gather_rows(n_threads=) (shardad #246), which the cell path uses for every
-# gather, first shipped in v0.7.1; without it a cell gather is ~12-20x slower.
-# The [cell] extra is pyfastpfor, required to even OPEN a codec='pfordelta'
-# archive -- what every production .csad is -- so it belongs here rather than
-# surfacing as a bare ImportError at open time.
-streaming = ["shardad[cell]>=0.7.1"]
-# `streaming-gpu` adds GPU device decode (GroupShard.x_cupy(), shardad #40) via
-# shardad's [gpu] extra (cupy-cuda12x + nvidia-nvcomp-cu12). Recommended install
-# for GPU users on SHARD-layout archives; there is no x_cupy equivalent for the
-# cell codec, so cell-layout archives take the host CSR path either way.
-streaming-gpu = ["shardad[cell,gpu]>=0.7.1"]
+# / CPU-CI installs. cellstream is the former `shardad`, renamed and published
+# to PyPI at 0.9.0; the floor is that first public release rather than the old
+# private v0.7.1 pin. The [gpu] extra is cupy + nvcomp, needed for device
+# decode; it belongs
+# here rather than surfacing as a bare ImportError at open time.
+#
+# NOT `cellstream[cell]`. That extra is `pyfastpfor`, which publishes an sdist
+# only -- so requiring it makes every install compile C++ -- and cellstream
+# 0.9.0's own reader says "pyfastpfor is deliberately NOT imported here ... The
+# Rust decoder never calls pyfastpfor". The Rust extension is non-optional as of
+# the rename, so the wheel path never needs it; the pure-Python fallback raises
+# an actionable "install pyfastpfor" error if it is ever reached.
+streaming = ["cellstream>=0.9.0"]
+# `streaming-gpu` adds GPU device decode (GroupShard.x_cupy()) via cellstream's
+# [gpu] extra (cupy-cuda12x + nvidia-nvcomp-cu12). Recommended install for GPU
+# users on SHARD-layout archives; there is no x_cupy equivalent for the cell
+# codec, so cell-layout archives take the host CSR path either way.
+streaming-gpu = ["cellstream[gpu]>=0.9.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -88,23 +94,17 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu126", marker = "platform_system == 'Linux'" }]
-# shardad is the OPTIONAL `streaming` extra only (the core library takes an
-# in-memory AnnData and never imports shardad). It is hosted privately at
-# ArcInstitute/shardad until PyPI distribution is decided, so this source
-# pins a tagged release via SSH for `uv sync --extra streaming[-gpu]`; switch to
-# a PyPI version string once it's published. Pinned to the v0.7.1 tag (was
-# v0.5.6, which predates layout='cell' entirely -- see gpudge_arc#110).
-# v0.7.1 is the floor for BOTH layouts: it carries the shard path's x_cupy
-# device decode + prefetch reader unchanged from v0.5.6, and adds the cell
-# format (v0.6.0) plus gather_rows(n_threads=) (v0.7.1, shardad #246).
-# NOTE 1: shardad's Rust extension is `optional = true` in its build, so an
-# install with no cargo toolchain silently falls back to the pure-Python cell
-# decoder -- correct on well-formed archives, several times slower.
-# NOTE 2: v0.7.1 does NOT carry shardad #252 (cell writer converts categorical
-# sort keys with .to_numpy(), losing category order, where the shard writer uses
-# .values). Cross-layout byte-identity is therefore scoped to archives written
-# with default ordering.
-shardad = { git = "ssh://git@github.com/ArcInstitute/shardad.git", tag = "v0.7.1" }
+# NOTE: there is deliberately no `cellstream` entry here. It used to be a
+# private git-SSH source pinned to `shardad`'s v0.7.1 tag; since the rename it
+# resolves from PyPI like any other dependency, so the `streaming` extra above
+# is the whole story. Removing it also removes the reason CI had to use
+# `uv pip install` rather than `uv sync` -- see .github/workflows/ci.yml.
+#
+# Two caveats that hung off the old pin are gone with it: cellstream's Rust
+# extension is no longer optional (a source build without a toolchain now fails
+# loudly rather than falling back to the slow pure-Python cell decoder), and the
+# categorical-ordering defect that scoped cross-layout byte-identity to
+# default-ordered archives was fixed upstream in 0.8.0, below this floor.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,23 +1,34 @@
 # Conda / mamba environment for gpudge.
 #
-# gpudge has no conda-forge package. So conda/mamba just provides Python + pip, and pip installs gpudge
-# (and the CUDA 12.6 torch build) from the git tag.
+# gpudge has no conda-forge package. So conda/mamba just provides Python + pip,
+# and pip installs gpudge (and the CUDA 12.6 torch build) from PyPI.
+#
+# The gpudge pin is EXACT, unlike the README's `pip install gpudge`. The two are
+# for different things: someone following the README wants the current release,
+# while this file is checked in beside the code it belongs to, so unpinned,
+# `mamba env create` from a v0.9.0 checkout would install whatever PyPI has
+# latest. It is one of the files a release cut must bump, and it always has
+# been; it was pinned to a git tag before gpudge was published and stays pinned
+# now that it resolves from PyPI.
+#
+# That pins gpudge, NOT the environment. Everything below gpudge -- torch,
+# numpy, scipy and the rest -- still resolves to whatever satisfies its range on
+# the day, so two `mamba env create` runs months apart will not agree. Pinning
+# the closure is a lockfile's job and this file is not one; if you need a
+# reproducible environment, install into it from a compiled constraints file.
 #
 #   mamba env create -f environment.yml   # or: conda env create -f environment.yml
 #   mamba activate gpudge
 #
 # The host needs an NVIDIA driver and a CUDA GPU with enough VRAM for the
-# reference pool; torch's CUDA libraries ship inside the pip wheel, so no
-# conda CUDA toolkit is needed.
+# reference pool; torch's CUDA libraries ship inside the pip wheel, so no conda
+# CUDA toolkit is needed.
 #
-# For the optional `de(archive=...)` streaming path, also install shardad
-# (private, shardad[cell]>=0.7.1) and switch the extra to [fast,streaming]:
-#   - "shardad[cell] @ git+ssh://git@github.com/ArcInstitute/shardad.git@v0.7.1"
-# (for GPU device decode use shardad[cell,gpu] via the streaming-gpu extra; pin
-#  the v0.7.1 tag, matching README and pyproject's [tool.uv.sources]. v0.7.1 is
-#  the floor for BOTH archive layouts: v0.5.6 predates layout='cell' entirely,
-#  and gather_rows(n_threads=) -- which the cell path uses for every gather --
-#  first shipped in v0.7.1.)
+# For the optional `de(archive=...)` streaming path, switch the extra to
+# [fast,streaming]; cellstream resolves from PyPI and needs no separate step.
+# (For GPU device decode use [fast,streaming-gpu], which adds cellstream's
+#  [gpu] extra. cellstream is the former shardad, renamed and first published
+#  at 0.9.0, which is the floor for both archive layouts.)
 name: gpudge
 channels:
   - conda-forge
@@ -26,4 +37,4 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126
-      - "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.8.0"
+      - "gpudge[fast]==0.9.0"

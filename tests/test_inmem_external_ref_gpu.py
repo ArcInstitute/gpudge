@@ -18,7 +18,7 @@ import anndata as ad
 import gpudge
 from conftest import _make_synth, needs_cuda   # bare import — CI gotcha
 
-shardad = pytest.importorskip("shardad", reason="requires gpudge[streaming]")
+cellstream = pytest.importorskip("cellstream", reason="requires gpudge[streaming]")
 from polars.testing import assert_frame_equal   # noqa: E402
 
 # check_exact=True is NOT optional in this file. polars' assert_frame_equal
@@ -43,9 +43,9 @@ def _build(tmp_path, *, seed):
     guides = full[~is_ntc].copy()
     ref = full[is_ntc].copy()
     d = str(tmp_path / "m2")
-    shardad.write_sharded(guides, d, format="v2", group_by="comparison",
+    cellstream.write_sharded(guides, d, format="v2", group_by="comparison",
                           reference=None, target_shard_bytes=4096)
-    arch = shardad.ShardedArchive(d)
+    arch = cellstream.ShardedArchive(d)
     inmem = ad.concat([gs.to_anndata() for gs in arch.iter_group_shards()],
                       axis=0)
     # var axis must round-trip identically (gene-axis check + parity rely on it)

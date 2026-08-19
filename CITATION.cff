@@ -5,7 +5,7 @@ abstract: >-
   A GPU-only Mann-Whitney U differential expression library for single-cell
   CRISPR perturbation screens. One entry point, de(), taking an in-memory
   AnnData, a separate control AnnData, a caller-supplied cell source, or a
-  streamed shardad archive. Two-sided asymptotic Mann-Whitney with tie and
+  streamed cellstream archive. Two-sided asymptotic Mann-Whitney with tie and
   continuity corrections, matching scipy.stats.mannwhitneyu, with per-group
   Benjamini-Hochberg adjustment and rank-based effect sizes.
 type: software

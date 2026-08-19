@@ -177,6 +177,6 @@ counts**. Passing either on data you already normalized double-normalizes it sil
 - **One-vs-rest**: `reference=gpudge.ALL_OTHERS` instead of a control label.
 - **Effect-size floors**: `lfc_threshold=` tests against a real floor rather than against
   zero; `tau_star=` reports the shift the rank test estimates. Both are in log2 units.
-- **Larger-than-RAM data**: `de(archive=…)` streams a shardad archive, and
+- **Larger-than-RAM data**: `de(archive=…)` streams a cellstream archive, and
   `de(cell_source=…)` takes cells from a callable you write.
 - The `de()` docstring in `src/gpudge/__init__.py` is the reference for all of it.

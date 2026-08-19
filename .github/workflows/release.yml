@@ -1,0 +1,105 @@
+# Publish gpudge to PyPI via Trusted Publishing (OIDC) — no API token anywhere.
+#
+# WHERE THIS MAY RUN. The `if:` guard below is the whole safety story. This file
+# exists in both repositories, because the published tree is generated from the
+# development one and carries its workflows along. Only the published repository
+# is a safe build source: an sdist is the WHOLE checkout, and the development
+# tree carries directories that are deliberately not published. Building there
+# would put them on a permanent public CDN — PyPI files can be yanked, never
+# deleted. So the guard pins the publishing repository by name, and the job is
+# skipped anywhere else.
+#
+# SETUP (once, on PyPI): the project's Settings -> Publishing -> add a trusted
+# publisher, matching this file exactly:
+#     owner:        ArcInstitute
+#     repository:   gpudge
+#     workflow:     release.yml
+#     environment:  pypi
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pypi:
+    # Never the development repository. See the header.
+    if: github.repository == 'ArcInstitute/gpudge'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/gpudge
+    permissions:
+      id-token: write      # the OIDC token Trusted Publishing exchanges
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build sdist and wheel
+        run: uv build --out-dir dist
+
+      # The gate that must be able to fail. An sdist is the whole checkout, so
+      # "what is in the tarball" is the only thing standing between an
+      # unpublished directory and a permanent public artifact. Asserted as an
+      # ALLOW-list of top-level entries rather than a deny-list of things not to
+      # ship: a deny-list would have to name them, and naming them here would
+      # publish them by itself.
+      - name: The sdist contains only what is meant to be published
+        run: |
+          set -euo pipefail
+          expected=$(printf '%s\n' \
+            .gemini .github .gitignore .python-version \
+            CHANGELOG.md CITATION.cff CODE_OF_CONDUCT.md CONTRIBUTING.md \
+            LICENSE PKG-INFO README.md SECURITY.md \
+            benchmarks docs environment.yml examples pyproject.toml src tests \
+            | sort)
+          actual=$(tar -tzf dist/*.tar.gz \
+            | sed -E 's|^gpudge-[^/]+/||' \
+            | awk -F/ 'NF && $1 != "" {print $1}' | sort -u)
+          if ! diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"); then
+            echo "::error::sdist top level does not match the published set (< expected, > actual)."
+            echo "::error::A new entry is not automatically safe: check it belongs in a public artifact."
+            exit 1
+          fi
+          echo "sdist top level matches the published set."
+
+      - name: The wheel contains only the package
+        run: |
+          set -euo pipefail
+          bad=$(unzip -Z1 dist/*.whl | grep -Ev '^(gpudge/|gpudge-[^/]+\.dist-info/)' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::wheel carries entries outside the package: $bad"
+            exit 1
+          fi
+          echo "wheel carries only gpudge/ and its dist-info."
+
+      # Unconditional on purpose. An earlier draft skipped this on
+      # `workflow_dispatch` and left the upload step ungated, so a manual run
+      # from a branch would have published whatever version `pyproject.toml`
+      # happened to carry, with nothing checking it. A dispatch is still
+      # allowed -- that is how a transient upload failure gets retried -- but it
+      # must select the TAG, not a branch. (Copilot review, PR #141.)
+      - name: Publishing requires a tag, and the version must match it
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/tags/v*) ;;
+            *) echo "::error::refusing to publish from ${GITHUB_REF}. Re-run this"
+               echo "::error::workflow with a v* tag selected as the ref."
+               exit 1 ;;
+          esac
+          tag="${GITHUB_REF_NAME#v}"
+          built=$(ls dist/*.tar.gz | sed -E 's|.*/gpudge-(.+)\.tar\.gz|\1|')
+          [ "$tag" = "$built" ] || {
+            echo "::error::tag $GITHUB_REF_NAME does not match built version $built"; exit 1; }
+          echo "tag and built version agree: $built"
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

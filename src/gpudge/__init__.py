@@ -238,11 +238,11 @@ def de(
         Single-cell expression matrix. Dense or sparse CSR X is accepted;
         sparse X is streamed to GPU per gene-chunk.
     archive : str | os.PathLike
-        Path to a shardad archive to stream instead of passing ``adata``.
+        Path to a cellstream archive to stream instead of passing ``adata``.
         Both layouts are accepted and dispatched automatically off the
         archive's own manifest (not its file extension): ``layout='shard'``
         and ``layout='cell'`` (``.csad``). Requires the optional ``streaming``
-        extra (``shardad[cell]>=0.7.1``). Exactly one of ``adata`` /
+        extra (``cellstream>=0.9.0``). Exactly one of ``adata`` /
         ``archive`` / ``cell_source`` must be given.
     shard_archive : str | os.PathLike
         Deprecated spelling of ``archive``; accepted with a
@@ -690,7 +690,7 @@ def de(
         * ``layout='shard'`` — CPU decode-ahead workers for
           ``iter_group_shards``. Peak host RAM scales with this (~14 GB per
           worker on CCL_2); it is the speed-vs-host-RAM dial.
-        * ``layout='cell'`` — decode threads for shardad's Rust cell gather.
+        * ``layout='cell'`` — decode threads for cellstream's Rust cell gather.
           Costs no extra host RAM; 16 is the measured sweet spot.
 
         Unused on the shard-layout GPU device-decode path, which requires

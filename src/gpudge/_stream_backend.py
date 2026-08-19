@@ -1,6 +1,6 @@
 """Layout dispatch + the internal contract ``stream_de`` drives.
 
-``stream_de`` names no shardad type. It opens a backend via ``open_backend``
+``stream_de`` names no cellstream type. It opens a backend via ``open_backend``
 and talks only to the surface below, so a new archive layout is a new backend
 rather than a new branch in the driver.
 
@@ -42,10 +42,10 @@ Backend surface (plain instance attributes unless noted):
 Implementations:
 
 - ``_shard_stream._ShardBackend`` -- ``layout='shard'``, wrapping
-  ``shardad.ShardedArchive``. **Legacy**: shard layout is slated for
+  ``cellstream.ShardedArchive``. **Legacy**: shard layout is slated for
   deprecation, and removing it is deleting that class and its module.
 - ``_cell_stream._CellBackend`` -- ``layout='cell'``, wrapping
-  ``shardad.CellStore``.
+  ``cellstream.CellStore``.
 """
 from __future__ import annotations
 
@@ -111,18 +111,18 @@ def validate_archive_reference(reference, labels):
     return named[0] if len(set(named)) == 1 else "|".join(label_list)
 
 
-def _import_shardad():
+def _import_cellstream():
     try:
-        import shardad
+        import cellstream
     except ImportError as e:  # pragma: no cover - exercised via monkeypatch
         raise ImportError(
             "de(archive=...) requires the optional 'streaming' extra, which "
-            "installs shardad. shardad is hosted privately at "
-            "ArcInstitute/shardad and is not published on PyPI, so the extra "
-            "only resolves with access to that repository -- see the Install "
-            "section of the README for the exact pin."
+            "installs cellstream (>=0.9.0, the former shardad) from PyPI. "
+            "Reinstall gpudge with the extra -- e.g. `pip install '.[streaming]'` "
+            "from a checkout, or add `streaming` to the pin in the README's "
+            "Install section."
         ) from e
-    return shardad
+    return cellstream
 
 
 def open_backend(archive, *, n_workers, prefetch):
@@ -130,20 +130,20 @@ def open_backend(archive, *, n_workers, prefetch):
 
     Dispatch is by attempt, not by file extension or manifest peek:
     ``ShardedArchive.__init__`` already raises ``IncompatibleSchemaError`` on a
-    ``layout='cell'`` archive and ``shardad.open`` raises the same on a
+    ``layout='cell'`` archive and ``cellstream.open`` raises the same on a
     shard-layout one, so one cheap failed open resolves the layout in both
     directions -- and an archive with a misleading extension still works.
 
     On the cell branch the shard error is chained under whatever
-    ``shardad.open`` reports, so a genuinely corrupt archive surfaces its real
+    ``cellstream.open`` reports, so a genuinely corrupt archive surfaces its real
     error rather than a misleading cell-flavoured one. A store that opens but
     whose backend construction then fails is closed before the error escapes.
     """
-    shardad = _import_shardad()
-    from shardad.errors import IncompatibleSchemaError
+    cellstream = _import_cellstream()
+    from cellstream.errors import IncompatibleSchemaError
 
     try:
-        arch = shardad.ShardedArchive(archive)
+        arch = cellstream.ShardedArchive(archive)
     except IncompatibleSchemaError as shard_err:
         # Import BEFORE opening the store: an ImportError here (a partial
         # install, a circular-import regression) would otherwise strand an
@@ -151,7 +151,7 @@ def open_backend(archive, *, n_workers, prefetch):
         # cannot cover, because there is nothing to close yet.
         from ._cell_stream import _CellBackend
         try:
-            store = shardad.open(archive)
+            store = cellstream.open(archive)
         except Exception as cell_err:
             raise cell_err from shard_err
         try:
