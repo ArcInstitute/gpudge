@@ -44,7 +44,7 @@ licensed `MIT`** (see `LICENSE` and `pyproject.toml`).
 >
 > Supersedes the 2026-07-25 audit, which was taken against the developer `.venv`
 > and therefore recorded a `shardad` version predating the `[cell]` extra entirely,
-> and omitted `pyfastpfor` and `pybind11` (gpudge_arc#120).
+> and omitted `pyfastpfor` and `pybind11` (`gpudge_arc#120`).
 
 ## How to regenerate
 
