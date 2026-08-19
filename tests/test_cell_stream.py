@@ -9,7 +9,7 @@ import pytest
 
 from conftest import _make_synth, needs_cuda
 
-shardad = pytest.importorskip("shardad", reason="requires gpudge[streaming]")
+cellstream = pytest.importorskip("cellstream", reason="requires gpudge[streaming]")
 
 # The cell writer warns that the format is experimental on every write; that is
 # a property of the format, not of anything gpudge does.
@@ -19,7 +19,7 @@ _EXPERIMENTAL = "experimental flat per-cell format"
 def _write_cell(adata, path, *, group_by, reference):
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*" + _EXPERIMENTAL + ".*")
-        shardad.write_sharded(adata, str(path), layout="cell",
+        cellstream.write_sharded(adata, str(path), layout="cell",
                               group_by=group_by, reference=reference, n_workers=2)
     return str(path)
 
@@ -46,12 +46,12 @@ def cell_mode2(tmp_path):
 
 
 def test_cell_group_ranges_shape(cell_mode1):
-    """The private shardad group table has the shape gpudge depends on, and the
+    """The private cellstream group table has the shape gpudge depends on, and the
     ranges tile [0, n_obs) with the reference leading. This test is the tripwire
-    for shardad changing CellStore._load_groups()."""
+    for cellstream changing CellStore._load_groups()."""
     from gpudge._cell_stream import _cell_group_ranges
     p, adata = cell_mode1
-    store = shardad.open(p)
+    store = cellstream.open(p)
     try:
         ref_labels, ranges = _cell_group_ranges(store)
         assert ref_labels == ["ntc"]
@@ -72,7 +72,7 @@ def test_cell_group_ranges_shape(cell_mode1):
 def test_cell_group_ranges_no_reference(cell_mode2):
     from gpudge._cell_stream import _cell_group_ranges
     p, adata_g, _, _ = cell_mode2
-    store = shardad.open(p)
+    store = cellstream.open(p)
     try:
         ref_labels, ranges = _cell_group_ranges(store)
         assert ref_labels is None
@@ -108,7 +108,7 @@ class _FakeStore:
       {"label": "a", "start": 5, "stop": 10}], None, 10, "duplicate"),
     # reference label absent from the group table
     ([{"label": "a", "start": 0, "stop": 10}], "zzz", 10, "not in the group table"),
-    # reference group is NOT leading -- shardad's read_reference() would gather
+    # reference group is NOT leading -- cellstream's read_reference() would gather
     # [0, ref_stop) and silently pull group 'a' into the reference pool
     ([{"label": "a", "start": 0, "stop": 5},
       {"label": "ntc", "start": 5, "stop": 10}], "ntc", 10, "leading"),
@@ -122,7 +122,7 @@ def test_cell_group_ranges_guards(groups, reference, n_obs, match):
 
 
 def test_cell_group_ranges_private_api_gone():
-    """A shardad that drops _load_groups() must fail loudly, not silently."""
+    """A cellstream that drops _load_groups() must fail loudly, not silently."""
     from gpudge._cell_stream import _cell_group_ranges
 
     class _NoGroups:
@@ -222,7 +222,7 @@ def test_zstd_cell_archive_backend(cell_zstd):
     pass for a decoder returning shuffled or zero-filled data."""
     from gpudge._stream_backend import open_backend
     p, adata = cell_zstd
-    store = shardad.open(p)
+    store = cellstream.open(p)
     try:
         assert store.manifest["codec"] == "zstd"
         assert store.manifest["schema_version"] == 6
@@ -253,7 +253,7 @@ def test_open_backend_dispatches_on_manifest_not_extension(tmp_path):
     liar_cell = _write_cell(adata, tmp_path / "actually_cell.shad",
                             group_by="comparison", reference="ntc")
     liar_shard = str(tmp_path / "actually_shard.csad")
-    shardad.write_sharded(adata, liar_shard, format="v2", group_by="comparison",
+    cellstream.write_sharded(adata, liar_shard, format="v2", group_by="comparison",
                           reference=["ntc"], target_shard_bytes=4096, n_workers=2)
     b1 = open_backend(liar_cell, n_workers=2, prefetch=0)
     b2 = open_backend(liar_shard, n_workers=2, prefetch=0)
@@ -295,7 +295,7 @@ def test_cell_backend_close_releases_the_store(cell_mode1):
 def test_cell_backend_close_keeps_the_handle_when_close_fails(cell_mode1):
     """close() must not drop its cleanup handle on a failed close.
 
-    shardad's CellStore.close() raises BufferError while an mmap view is still
+    cellstream's CellStore.close() raises BufferError while an mmap view is still
     exported, so clearing _store before the call would leave the backend unable
     to retry and the mmap leaked."""
     from gpudge._stream_backend import open_backend
@@ -499,7 +499,7 @@ def test_cell_backend_external_ref_gene_axis_mismatch_raises(cell_mode2):
 
 
 def _write_shard(adata, path, *, group_by, reference):
-    shardad.write_sharded(adata, str(path), format="v2",
+    cellstream.write_sharded(adata, str(path), format="v2",
                           group_by=group_by, reference=reference,
                           target_shard_bytes=4096, n_workers=2)
     return str(path)
@@ -509,11 +509,14 @@ def _write_shard(adata, path, *, group_by, reference):
 def twin_mode1(tmp_path):
     """The SAME AnnData written both ways, with DEFAULT ordering.
 
-    Default ordering matters: shardad v0.7.1's cell writer converts categorical
-    sort keys with .to_numpy() (losing category order) where the shard writer
-    uses .values (shardad #252, unreleased fix), so a categorical
-    sort_within_group would order rows differently between layouts and move the
-    float64 group means. The exactness promise is scoped accordingly."""
+    Default ordering was load-bearing under the old shardad v0.7.1 pin: its cell
+    writer converted categorical sort keys with .to_numpy() (losing category
+    order) where the shard writer used .values (shardad #252), so a categorical
+    sort_within_group ordered rows differently between layouts and moved the
+    float64 group means. Fixed upstream in 0.8.0, below the >=0.9.0 floor. The
+    fixture keeps default ordering anyway: it is what the twin-mode exactness
+    promise is stated against, and pinning it here keeps this test independent
+    of that upstream fix."""
     adata = _make_synth(n_cells=600, n_genes=40, n_guides=8, sparse=True, seed=1)
     cell = _write_cell(adata, tmp_path / "t1.csad",
                        group_by="comparison", reference="ntc")

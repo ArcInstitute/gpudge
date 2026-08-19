@@ -27,8 +27,8 @@ gpudge is a compute library. It does not open sockets, spawn processes, or
 authenticate anyone. Realistically the interesting surface is **the input you
 hand it**:
 
-- an untrusted `.h5ad` or `shardad` archive — parsing is done by `anndata`,
-  `h5py` and `shardad`, so a malicious file is mostly *their* attack surface,
+- an untrusted `.h5ad` or `cellstream` archive — parsing is done by `anndata`,
+  `h5py` and `cellstream`, so a malicious file is mostly *their* attack surface,
   but a crash or a wild allocation reachable through gpudge's own slicing and
   chunk-sizing code is in scope here;
 - `de(cell_source=…)`, which runs a callable you supply — that is by design, and

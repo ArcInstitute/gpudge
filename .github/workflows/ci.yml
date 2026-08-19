@@ -6,15 +6,16 @@ name: CI
 #   - GPU-gated tests (the `needs_cuda` skipif in tests/conftest.py — a skipif,
 #     not a registered marker, so `pytest -m needs_cuda` selects nothing) skip
 #     on the CPU runner.
-#   - The three shardad-gated suites (tests/test_shard_stream.py,
+#   - The three cellstream-gated suites (tests/test_shard_stream.py,
 #     tests/test_cell_stream.py, tests/test_inmem_external_ref_gpu.py) each
-#     carry a module-level `pytest.importorskip("shardad")`, so all three files
-#     skip entirely without the private `[streaming]` extra. Between them that
-#     is 141 cases, 70 of which need no GPU.
+#     carry a module-level `pytest.importorskip("cellstream")`, so all three files
+#     skip entirely without the optional `[streaming]` extra. Between them that
+#     is 141 cases, 70 of which need no GPU -- and since cellstream is on PyPI
+#     those 70 are now runnable on a stock runner, which wants its own job.
 #   - The real-data tests (tests/test_real_data.py) skip when the dataset path
 #     is absent (it always is on CI).
 # So this job goes green on a stock CPU runner with no GPU and without the
-# `[streaming]` extra — meaning no shardad git-SSH dependency is fetched.
+# `[streaming]` extra — it proves gpudge's CORE install needs nothing optional.
 #
 # The `[fast]` extra (numba) IS installed: the numba CSR kernel is a CPU
 # code path, so installing it exercises that code on CI rather than the
@@ -69,16 +70,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache-dependency-glob: pyproject.toml
 
-      # Install with `uv pip` (NOT `uv sync`): a fresh `uv sync` builds uv's
-      # universal lock, which resolves EVERY source in [tool.uv.sources] —
-      # including the private shardad git-SSH source — even when the
-      # `streaming` extra isn't requested, and the no-SSH runner can't clone it
-      # (Permission denied (publickey)). `uv pip install` does pip-style
-      # resolution of only the requested extras, so shardad (streaming-only) is
-      # never touched. torch resolves from PyPI here (the cu126 source is also
-      # skipped), which is fine: CI is CPU-only and GPU tests skip. `[fast]`
-      # (numba) IS installed so the numba CSR kernel — a CPU code path — is
-      # exercised rather than the scipy fallback.
+      # `uv pip install` does pip-style resolution of only the requested
+      # extras. It used to be mandatory: a fresh `uv sync` resolves EVERY source
+      # in [tool.uv.sources], and that table carried a private cellstream (then
+      # shardad) git-SSH entry the no-SSH runner could not clone, even when the
+      # `streaming` extra wasn't requested. That entry is gone since the rename,
+      # so `uv sync` would work now too. torch resolves from PyPI here (the cu126
+      # source is skipped), which is fine: CI is CPU-only and GPU tests skip.
+      # `[fast]` (numba) IS installed so the numba CSR kernel — a CPU code path —
+      # is exercised rather than the scipy fallback.
+      #
+      # `[streaming]` is deliberately NOT installed here: this job's purpose is
+      # to prove gpudge's CORE install needs nothing optional. Covering the 70
+      # non-CUDA cellstream cases is now possible on a stock runner and wants its
+      # own job rather than widening this one.
       - name: Install dependencies
         run: uv pip install -e ".[dev,fast]"
 

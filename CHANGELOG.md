@@ -13,6 +13,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-19
+
+### Changed
+
+- **The streaming dependency is now `cellstream`, from PyPI.** `shardad` has been
+  renamed to [`cellstream`](https://github.com/ArcInstitute/cellstream) and
+  published; the `streaming` / `streaming-gpu` extras now pin
+  `cellstream>=0.9.0` and `cellstream[gpu]>=0.9.0`. (`gpudge_arc#139`)
+
+  **The streaming extra now installs without Arc access.** The private
+  git-SSH entry in `[tool.uv.sources]` is deleted, and with it the reason
+  `uv sync` failed with `Permission denied (publickey)` for anyone without a key
+  — `uv sync --extra streaming` now resolves like any other project. Both extras
+  were verified to resolve with SSH disabled entirely.
+
+  Every symbol gpudge uses survived the rename, so this is a rename and a floor
+  bump, not an API migration. The public gpudge API is unchanged: `de(archive=)`,
+  `layout='shard'` / `'cell'`, `stream_n_workers` and `stream_prefetch` are named
+  for archive layouts, not for the package.
+
+  Two caveats retire with the old pin. cellstream's Rust extension is no longer
+  optional, so a source build without a toolchain fails loudly instead of
+  silently falling back to the slow pure-Python cell decoder. And the categorical
+  `sort_within_group` ordering defect that scoped cross-layout byte-identity to
+  default-ordered archives (`shardad #252`) was fixed upstream in 0.8.0, below
+  this floor.
+
+  The extras pin `cellstream>=0.9.0`, **not** `cellstream[cell]`: that extra is
+  `pyfastpfor`, which publishes an sdist only, and cellstream's Rust decoder
+  never calls it — requiring it would make every install compile C++ for nothing.
+
+  cellstream ships Linux x86_64 wheels only (`manylinux_2_28`, cp311/cp312, and
+  an SSE4.1 floor), matching gpudge's CI matrix. There is no wheel for Windows,
+  aarch64 or Python 3.13, so `de(archive=…)` is effectively Linux-x86_64-only.
+  The other three input modes are unaffected.
+
+- **gpudge is on PyPI.** `pip install gpudge` installs this library; previously
+  the name held only a 0.0.1 reservation stub. Published by GitHub Actions via
+  PyPI Trusted Publishing (OIDC) — no API token exists to leak. The workflow is
+  pinned to the published repository by name, because an sdist is the whole
+  checkout and the development tree carries directories that are not published;
+  it asserts the sdist's top level against an allow-list before uploading.
+
+  Historical references to `shardad` in this file, `docs/release-notes/`,
+  `docs/reviews/` and the design documents are left as written: they record what
+  shipped under the name it shipped under.
+
 ## [0.8.0] — 2026-08-18
 
 ### Added
@@ -1042,11 +1089,12 @@ ULP of the CPU baseline on every assertable column.
   until shardad v0.3 lands an on-GPU read path.
 
 <!-- Compare links resolve against this repository, which is published as
-     milestone snapshots: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.7.0 and 0.8.0 are tagged
-     here. The versions between them are documented above but are not separately
-     tagged here, so they carry no compare link. -->
+     milestone snapshots: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.7.0, 0.8.0 and 0.9.0 are
+     tagged here. The versions between them are documented above but are not
+     separately tagged here, so they carry no compare link. -->
 
-[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ArcInstitute/gpudge/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ArcInstitute/gpudge/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ArcInstitute/gpudge/compare/v0.3.1...v0.7.0
 [0.3.1]: https://github.com/ArcInstitute/gpudge/compare/v0.3.0...v0.3.1

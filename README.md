@@ -9,7 +9,7 @@ Arc VCI pipeline uses.
 
 - **Fast:** the whole comparison in one GPU call, with the reference sorted once and
   reused across perturbations — on the CCL_1/500-perturbation DE stage, **~4,500× vs scanpy**, **~600× vs CPU pdex**, **~140× vs rapids-singlecell**; DE time stays near-constant as the perturbation count grows
-- **Low host RAM**: can use shardad to stream AnnData shards without loading full matrix into RAM, enabling scaling to tens of millions of cells
+- **Low host RAM**: can use cellstream to stream AnnData shards without loading full matrix into RAM, enabling scaling to tens of millions of cells
 - **Opt-in per-gene filters** (`filter_gene_min_mean_value`,
   `filter_gene_min_cpm_cell`, etc.) — unit-named and AND-combinable;
   see the `de()` docstring for the full set
@@ -67,12 +67,12 @@ layouts (max abs diff 0.0 on log2FC / p-value / p_adj across all 94 M rows):
 | Path | Host RAM | Load | DE | Wall |
 |---|--:|--:|--:|--:|
 | **Full matrix** (float32 data + int64 indices; standard scipy CSR) | 448 GB | 253 s | 181 s | 7.2 min |
-| **Narrowed in-memory** (uint16 data + int32 indices via shardad; normalize inside gpudge) | **236 GB** | 88 s | 75 s | **2.7 min** |
+| **Narrowed in-memory** (uint16 data + int32 indices via cellstream; normalize inside gpudge) | **236 GB** | 88 s | 75 s | **2.7 min** |
 | **Streaming — default** (`de(archive=…)`, `stream_n_workers=16`; reference GPU-resident, shards streamed) | 223 GB | — | — | 4.7 min |
 | **Streaming — serial** (add `stream_prefetch=0`; lowest host-RAM floor, byte-identical) | **31 GB** | — | — | 22 min |
 
 Narrowing the in-memory CSR is the key trick: loading **uint16 counts + int32
-indices** (via shardad) and letting gpudge normalize on-GPU
+indices** (via cellstream) and letting gpudge normalize on-GPU
 (`normalize_target_sum=`) — instead of materializing a float copy on the host —
 roughly **halves both host RAM (448→236 GB) and DE time** versus the full
 float32/int64 matrix, for the same bit-identical output. The DE speedup is a
@@ -89,7 +89,7 @@ worker. The **default** `stream_n_workers=16` runs in 282 s at ~223 GB; adding
 `stream_prefetch=0` (serial) drops the floor to ~31 GB (one resident shard) at
 ~1331 s (~22 min) — an order-of-magnitude lower RAM for datasets too large to
 materialize at all. The two figures above are the two ends of that dial; see the
-[streaming-knobs section](#streaming-a-shardad-archive) for the full trade
+[streaming-knobs section](#streaming-a-cellstream-archive) for the full trade
 (`stream_n_workers` 4 / 8 / 16 → ~75 / 126 / 223 GB, ~2.8× / 3.8× / 4.7× over
 serial). The GPU device-decode path (`[streaming-gpu]`) keeps only one shard
 resident and is byte-identical (see [Install](#install)).
@@ -111,34 +111,43 @@ dependencies**.
 
 ```bash
 # torch's CUDA 12.6 build is pulled from the PyTorch index:
-pip install --extra-index-url https://download.pytorch.org/whl/cu126 \
-  "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.8.0"
+pip install --extra-index-url https://download.pytorch.org/whl/cu126 "gpudge[fast]"
 ```
 
-Requires **Python ≥ 3.11**.
+Requires **Python ≥ 3.11**. gpudge is a pure-Python wheel; the GPU comes from
+torch.
 
-> **Not on PyPI yet.** The name `gpudge` is held there by a 0.0.1 reservation
-> stub with none of this library's functionality, so a bare `pip install gpudge`
-> installs that stub. Use the pin above until a real release is published.
+To pin an exact commit instead of a release — or to install a change that has
+not been released yet:
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cu126 \
+  "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.9.0"
+```
 
 Extras:
 - **`[fast]`** — adds `numba` (parallel single-pass CSR row-gather; ~3× faster on
   big sparse inputs). Without it the scipy `X[rows, cols].toarray()` fallback is
   used; correctness is identical.
 - **`[dev]`** — `pytest`, `ruff`, `scanpy`, `pyyaml`.
-- **`[streaming]`** — adds [`shardad`](https://github.com/ArcInstitute/shardad)
+- **`[streaming]`** — adds [`cellstream`](https://github.com/ArcInstitute/cellstream)
   for `de(archive=…)`. CPU-friendly: pulls no CUDA wheels. (Device decode
-  auto-engages whenever cupy is already importable — e.g. via conda — and shardad
-  exposes `x_cupy()`; the `[streaming-gpu]` extra below just guarantees those GPU
-  deps are installed.) shardad is also private, so pip
-  can't resolve it from PyPI — install it first, then add the extra. The pin is
-  `shardad[cell]>=0.7.1` (the `v0.7.1` tag, matching `[tool.uv.sources]` in
-  `pyproject.toml`):
+  auto-engages whenever cupy is already importable — e.g. via conda — and
+  cellstream exposes `x_cupy()`; the `[streaming-gpu]` extra below just
+  guarantees those GPU deps are installed.) It resolves from PyPI like any other
+  dependency, so the extra is all you need:
   ```bash
-  pip install "shardad[cell] @ git+ssh://git@github.com/ArcInstitute/shardad.git@v0.7.1"
+  pip install "gpudge[fast,streaming]"
   ```
-- **`[streaming-gpu]`** — `shardad[cell,gpu]>=0.7.1`, i.e. `[streaming]` plus
-  shardad's `[gpu]` extra (cupy + nvcomp), for GPU **device decode**: each shard
+
+  **Platform:** cellstream ships Linux **x86_64** wheels only (`manylinux_2_28`,
+  i.e. glibc ≥ 2.28, cp311 and cp312), and the vendored FastPFor is built for
+  **SSE4.1** — check `grep sse4_1 /proc/cpuinfo` rather than assuming by CPU age.
+  There is no wheel for Windows, for aarch64, or for Python 3.13, and a source
+  build needs a Rust toolchain and a C++11 compiler. So `de(archive=…)` is
+  effectively Linux-x86_64-only; the other three input modes are unaffected.
+- **`[streaming-gpu]`** — `cellstream[gpu]>=0.9.0`, i.e. `[streaming]` plus
+  cellstream's `[gpu]` extra (cupy + nvcomp), for GPU **device decode**: each shard
   is decompressed on the GPU by `GroupShard.x_cupy()`, which hands back a device
   cupy **CSR** that gpudge then densifies per gene-chunk — so the host never
   materialises the decoded shard (the compressed bytes still pass through it on
@@ -148,7 +157,7 @@ Extras:
   layout only** — there is no `x_cupy` equivalent for the cell codec, so a
   cell-layout archive takes the host CSR path either way:
   ```bash
-  pip install "shardad[cell,gpu] @ git+ssh://git@github.com/ArcInstitute/shardad.git@v0.7.1"
+  pip install "gpudge[fast,streaming-gpu]"
   ```
 
 ### uv (recommended for development)
@@ -158,19 +167,16 @@ git clone https://github.com/ArcInstitute/gpudge.git && cd gpudge
 uv venv && uv pip install --torch-backend=cu126 -e ".[dev,fast]"
 ```
 
-Use `uv pip install`, **not `uv sync`**, unless you have SSH access to the
-private `shardad` repository. `uv sync` builds uv's universal lock, which
-resolves every entry in `[tool.uv.sources]` — including the `shardad` git-SSH
-source — even when you did not ask for the `streaming` extra, and fails with
-`Permission denied (publickey)` without a key. `uv pip install` resolves only
-the extras you requested. This is what CI does, and why.
-
 `--torch-backend=cu126` (uv ≥ 0.7.3) is needed because `uv pip install` skips
-`[tool.uv.sources]` too, so without it torch comes from PyPI. CI omits the flag
+`[tool.uv.sources]`, so without it torch comes from PyPI. CI omits the flag
 deliberately — it is CPU-only.
 
-With that access, `uv sync --extra streaming` does work and pulls shardad and
-the cu126 torch build from their pins with no manual `--extra-index-url`.
+`uv sync --extra streaming` also works and pulls the cu126 torch build from its
+pin with no manual `--extra-index-url`. (Before the `shardad` → `cellstream`
+rename this was not true: `[tool.uv.sources]` carried a private git-SSH entry
+that `uv sync` resolved even when the `streaming` extra was not requested, so it
+failed with `Permission denied (publickey)` for anyone without a key. That entry
+is gone — cellstream comes from PyPI.)
 
 ### conda / mamba
 
@@ -322,9 +328,9 @@ order — enough to move a float32 tie. Such an `X` under a re-ordering `rows=`
 is rejected rather than silently summed; pass
 `np.require(X, requirements=["C", "A"])`.
 
-### Streaming a shardad archive
+### Streaming a cellstream archive
 
-Both shardad layouts are accepted and detected automatically from the archive's
+Both cellstream layouts are accepted and detected automatically from the archive's
 manifest (not its file extension): `layout='shard'` and `layout='cell'`
 (`.csad`). The knobs differ by layout — on shard layout `stream_n_workers` sizes
 a decode-ahead worker pool (~14 GB host RAM **per worker**) and `stream_prefetch`
@@ -378,9 +384,8 @@ synchronously in batches sized from the archive's own manifest. There is no
 GPU device decode for cell layout.
 
 Output is bit-identical regardless of either knob. Requires the optional
-`streaming` extra — shardad is a private git dependency (not on PyPI), so install
-it first per the Installation section (or `uv sync --extra streaming`, which reads
-the `[tool.uv.sources]` git pin).
+`streaming` extra (`pip install "gpudge[streaming]"`), which pulls cellstream
+from PyPI.
 
 ### Rename / select output columns
 
@@ -412,7 +417,7 @@ Every keyword parameter, grouped. `adata` is the sole positional.
 | `mean_calc` | `"arithmetic"` | one of `arithmetic`, `geometric` |
 | `epsilon` | `1e-9` | matches `scanpy.tl.rank_genes_groups` |
 | **Where the cells come from** ||
-| `archive` | `None` | stream a shardad archive instead of an in-memory `adata`; both layouts, detected from the manifest |
+| `archive` | `None` | stream a cellstream archive instead of an in-memory `adata`; both layouts, detected from the manifest |
 | `shard_archive` | `None` | deprecated spelling of `archive=`; still accepted, emits a `DeprecationWarning` |
 | `cell_source` | `None` | callable yielding one `CellGroup(label, X, rows=None)` per target group |
 | `targets` | `None` | ordered target labels; required with `cell_source=`, and defines output row order |

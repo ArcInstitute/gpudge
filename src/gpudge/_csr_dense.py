@@ -186,7 +186,7 @@ def csr_row_sums(X) -> np.ndarray:
         _csr_row_sums_numba(X.data, X.indptr, out)
         return out
     # Fallback: scipy/numpy. The reduction must accumulate in float64, not in
-    # X.data's dtype: a float32 CSR (what shardad's cell gather_rows returns)
+    # X.data's dtype: a float32 CSR (what cellstream's cell gather_rows returns)
     # would otherwise round where the same counts as a narrow integer dtype
     # (what the shard reader can return) stay exact, and the two streaming
     # layouts would disagree on CPM scales, the median target, and every cpm_*

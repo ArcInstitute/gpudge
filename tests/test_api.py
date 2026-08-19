@@ -396,7 +396,7 @@ def test_de_rejects_nonfinite_epsilon():
 def test_de_rejects_nonfinite_epsilon_streaming_dispatch():
     """Parity with the in-memory check: the streaming dispatch (shard_archive=)
     rejects non-finite epsilon at the same de()-level guard, which fires before
-    any shardad import — so this runs without the optional streaming extra."""
+    any cellstream import — so this runs without the optional streaming extra."""
     for bad in (float("nan"), float("inf")):
         with pytest.raises(ValueError, match="finite"):
             de(shard_archive="/nonexistent", epsilon=bad)
@@ -404,9 +404,9 @@ def test_de_rejects_nonfinite_epsilon_streaming_dispatch():
 
 def test_de_rejects_bad_stream_n_workers():
     """stream_n_workers must be an int >= 1, rejected at the de()-level guard
-    (fires before any shardad import or archive open — runs on shardad-less CPU
+    (fires before any cellstream import or archive open — runs on cellstream-less CPU
     CI). Lives here, not in test_shard_stream.py, whose module-level
-    importorskip('shardad') would skip it without the streaming extra."""
+    importorskip('cellstream') would skip it without the streaming extra."""
     with pytest.raises(ValueError, match="stream_n_workers"):
         de(shard_archive="/nonexistent", stream_n_workers=0)
     for bad in (1.5, True):
@@ -424,7 +424,7 @@ def test_de_rejects_bad_stream_prefetch():
 
 
 def test_iter_kwargs_serial_and_prefetch():
-    """_iter_kwargs(n_workers, prefetch) is a pure helper (no shardad) — keep it
+    """_iter_kwargs(n_workers, prefetch) is a pure helper (no cellstream) — keep it
     covered on CPU CI. prefetch<=0 -> serial (bare iter_group_shards());
     prefetch>=1 -> {prefetch, n_workers} for that-many-way decode-ahead."""
     from gpudge import _shard_stream as ss
@@ -435,11 +435,11 @@ def test_iter_kwargs_serial_and_prefetch():
 
 
 def test_should_device_decode_matrix(monkeypatch):
-    """_should_device_decode truth table (pure helper, no shardad/cupy needed —
+    """_should_device_decode truth table (pure helper, no cellstream/cupy needed —
     monkeypatched). Lives here, not in test_shard_stream.py, whose module-level
-    importorskip('shardad') would skip it on shardad-less CPU CI. Device decode
+    importorskip('cellstream') would skip it on cellstream-less CPU CI. Device decode
     requires an x_cupy-capable archive (packed schema_version 3 — the v0.5.x
-    default — OR legacy v2-directory 2) AND cupy AND shardad.x_cupy."""
+    default — OR legacy v2-directory 2) AND cupy AND cellstream.x_cupy."""
     from gpudge import _shard_stream as ss
 
     class _Arch:
@@ -461,7 +461,7 @@ def test_should_device_decode_matrix(monkeypatch):
     assert ss._should_device_decode(a) is False
 
     monkeypatch.setattr(ss, "_cupy_available", lambda: True)
-    monkeypatch.setattr(ss, "_x_cupy_available", lambda: False)  # old shardad -> host
+    monkeypatch.setattr(ss, "_x_cupy_available", lambda: False)  # old cellstream -> host
     assert ss._should_device_decode(a) is False
 
 
