@@ -8,8 +8,13 @@ Severity breakdown:
 - **Critical:** 0
 - **High:** 1
 - **Medium:** 3
-- **Low:** 10
-- **Nit:** 8
+- **Low:** 11
+- **Nit:** 7
+
+(The Low/Nit split read 10/8 until 2026-08-18. The findings below, and the
+resolution table added the same day, are L1–L11 and N1–N7: a transcription
+error in this summary, not a change to any finding. The total of 22 was always
+right.)
 
 No live correctness bug exists in any realistic, supported code path. The core MWU statistic is bit-perfect vs scipy. The findings cluster into: one genuine silent-corruption risk on real-world input, a band of test-coverage gaps around the numerical core and the v0.3.0 streaming headline, a few version/doc drifts from the release, and a long tail of degenerate-input and budgeting nits.
 
@@ -18,6 +23,43 @@ No live correctness bug exists in any realistic, supported code path. The core M
 2. **Core MWU correctness is invisible to CI** — the only scipy-equivalence tests are `@needs_cuda`, so the device-agnostic statistic is never exercised on the CPU-only CI; a tie/continuity/variance regression passes green. (MEDIUM)
 3. **Streaming equivalence is correlation-only** — `_assert_equiv` checks Pearson `> 0.9999999`, which is blind to any affine scale/offset bug exactly where streaming drift is most plausible. (MEDIUM)
 4. **`environment.yml` ships v0.2.0** — the documented conda install path installs the previous release, so conda users miss every 0.3.0 feature. (MEDIUM)
+
+---
+
+## Resolution status
+
+Added 2026-08-18. **All 22 findings were addressed in v0.3.1 ([#59](https://github.com/ArcInstitute/gpudge_arc/pull/59))**, the release immediately following this review; two of them deliberately by deciding no code should change. Statuses below were re-verified against the tree at `v0.8.0`, and the *Evidence* column names something you can open — a regression test that cites the finding ID, or the code that now carries the guard.
+
+| # | Severity | Finding | Status | Evidence |
+|---|---|---|---|---|
+| H1 | High | NaN/None `groupby` labels bucketed into `'nan'`/`'None'` groups | **Fixed** (v0.3.1); guard broadened in v0.8.0 ([#124](https://github.com/ArcInstitute/gpudge_arc/pull/124)) | `_ingest.MISSING_LABEL_SPELLINGS` and the mirroring guard in `_shard_stream.py`, which was the only streaming layout when this was fixed; `_cell_stream.py` gained the same screen when the cell layout arrived in v0.7.0. ⚠️ One backend-parity gap remains open as [#127](https://github.com/ArcInstitute/gpudge_arc/issues/127) — a group *genuinely* named `nan` is rejected on streaming but accepted in memory |
+| M1 | Medium | MWU-vs-scipy correctness tests all `@needs_cuda` | **Fixed** | `test_mwu.py::test_mwu_ref_matches_scipy_cpu`, which cites M1 |
+| M2 | Medium | Streaming equivalence checked Pearson correlation only | **Fixed** | `test_shard_stream.py::_assert_equiv` — `allclose(rtol=1e-5, atol=1e-7, equal_nan=True)` over full row coverage, with the M2 reasoning at the call site |
+| M3 | Medium | `environment.yml` pinned `gpudge @v0.2.0` | **Fixed** | pins the current release tag; kept in step with README by a note in both |
+| L1 | Low | `all_others` N==1 → `tie_corr` divide-by-zero NaN | **Fixed** | `test_api.py`, docstring cites L1 |
+| L2 | Low | ref-mode empty target reported `p_value=0.0` | **Fixed** | `_mwu.py` returns zeros + NaN when `m == 0 or n_ref == 0` |
+| L3 | Low | `epsilon` accepted NaN and +inf | **Fixed** | `math.isfinite(epsilon)` guard; `test_de_rejects_nonfinite_epsilon` (+ the streaming-dispatch twin) |
+| L4 | Low | `output_columns={}` yielded a degenerate frame | **Fixed** | `test_api.py`, docstring cites L4 |
+| L5 | Low | Non-string `reference` gave an opaque error | **Fixed** | `test_api.py`, docstring cites L5 |
+| L6 | Low | `all_others` chunk budget under-estimated GPU peak | **Fixed** | `_stream.py` comment cites L6 |
+| L7 | Low | Streaming heuristic budgeted accumulators Phase 1 never allocates | **Fixed** (v0.3.1); model refined again in v0.8.0 | the `UNCONDITIONAL:` comment on the sizer in `__init__.py`, which states that the Phase-1 target tile is modelled whenever the sizer runs |
+| L8 | Low | Phase-1 `del shard, Xs` defeated by the `_chunk` closure | **Fixed** | v0.3.1 "`/dev/shm` cleanup"; `del Xs, Ls` per shard in `_shard_stream.py` |
+| L9 | Low | `log2_fold_change` never checked against a closed form | **Fixed** | `test_api.py`, docstring cites L9 |
+| L10 | Low | Multi-block path of `_tie_term_per_gene` never exercised | **Fixed** | `test_mwu.py::test_tie_term_per_gene_multi_block`, cites L10 |
+| L11 | Low | `environment.yml` recommended `shardad @v0.2.0` | **Fixed** | pins `shardad[cell] v0.7.1`, the floor both archive layouts need |
+| N1 | Nit | `epsilon=0` + all-zero gene → NaN/inf `log2_fold_change` | **Documented, then pinned** | documented in the `de()` docstring and README; the degenerate value is pinned by a test added in v0.8.0 |
+| N2 | Nit | `.item()` forces per-chunk GPU→CPU syncs | **No change** | a perf nit with no correctness impact; the syncs are still there in `_mwu.py` |
+| N3 | Nit | A group literally named `'all_others'` is remapped | **No change, deliberate** | this review's own recommendation was "no action before the legacy spelling is removed"; the behaviour is noted in `__init__.py` |
+| N4 | Nit | `mwu_ref` sentinel test checked only the p-value half | **Fixed** | `test_mwu.py` now asserts `(U[ref_idx] == 0).all()`, citing N4 |
+| N5 | Nit | `MeanCalc` / `__version__` absent from the README API docs | **Fixed** | both documented in the README ([#126](https://github.com/ArcInstitute/gpudge_arc/pull/126)) |
+| N6 | Nit | `csr_row_sums` docstring said "CSR" but accepts dense | **Fixed** | now "Per-row sum of a CSR sparse OR dense matrix" |
+| N7 | Nit | README/SKILL listed 5 of the 10 default output columns | **Fixed** | both now list all ten under a `columns (10):` heading |
+
+Two entries are **not** code changes, and are listed that way on purpose: N2 was
+judged a perf nit not worth the churn, and N3 was a reserved-word behaviour this
+review itself recommended leaving alone until the legacy `"all_others"` spelling
+is removed. "Addressed" is not the same as "changed", and a resolution table
+that blurred the two would be worth less than none.
 
 ---
 
