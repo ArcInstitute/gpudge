@@ -1,6 +1,6 @@
 [project]
 name = "gpudge"
-version = "0.9.0"
+version = "0.9.1"
 description = "Lightweight GPU-only Mann–Whitney U differential expression."
 readme = "README.md"
 authors = [{ name = "Arc Institute" }]
@@ -61,9 +61,9 @@ fast = ["numba>=0.59"]
 # Optional: streaming a cellstream archive directly (de(archive=...)).
 # The core library takes an in-memory AnnData and does NOT need cellstream.
 # `streaming` is the CPU-friendly base: pulls no CUDA-only wheels onto host-only
-# / CPU-CI installs. cellstream is the former `shardad`, renamed and published
-# to PyPI at 0.9.0; the floor is that first public release rather than the old
-# private v0.7.1 pin. The [gpu] extra is cupy + nvcomp, needed for device
+# / CPU-CI installs. The floor is 0.9.0, cellstream's first PyPI release, which
+# is also the first version carrying both archive layouts.
+# The [gpu] extra is cupy + nvcomp, needed for device
 # decode; it belongs
 # here rather than surfacing as a bare ImportError at open time.
 #
@@ -94,11 +94,10 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu126", marker = "platform_system == 'Linux'" }]
-# NOTE: there is deliberately no `cellstream` entry here. It used to be a
-# private git-SSH source pinned to `shardad`'s v0.7.1 tag; since the rename it
-# resolves from PyPI like any other dependency, so the `streaming` extra above
-# is the whole story. Removing it also removes the reason CI had to use
-# `uv pip install` rather than `uv sync` -- see .github/workflows/ci.yml.
+# NOTE: there is deliberately no `cellstream` entry here. It resolves from PyPI
+# like any other dependency, so the `streaming` extra above is the whole story --
+# which is also why CI no longer has to prefer `uv pip install` over `uv sync`;
+# see .github/workflows/ci.yml.
 #
 # Two caveats that hung off the old pin are gone with it: cellstream's Rust
 # extension is no longer optional (a source build without a toolchain now fails

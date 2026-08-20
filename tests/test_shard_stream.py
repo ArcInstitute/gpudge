@@ -731,18 +731,6 @@ def test_stream_empty_targets_respects_output_columns(tmp_path):
     assert df.schema["p"] == pl.Float64
 
 
-def test_missing_cellstream_import_message(monkeypatch):
-    import builtins
-    from gpudge._stream_backend import _import_cellstream
-    real_import = builtins.__import__
-    def fake(name, *a, **k):
-        if name == "cellstream":
-            raise ImportError("no cellstream")
-        return real_import(name, *a, **k)
-    monkeypatch.setattr(builtins, "__import__", fake)
-    with pytest.raises(ImportError, match="streaming"):
-        _import_cellstream()
-
 
 def test_resolve_mode1_reference_read_none_raises(archive_mode1, monkeypatch):
     # Manifest declares a reference shard but read_reference() returns None
@@ -1019,7 +1007,7 @@ def test_stream_empty_targets_with_lfc_grid(archive_mode1, tmp_path):
 
 # --- tau_star over the streaming paths -----------------------------------
 # CI is CPU-only and does not even COLLECT this module (it needs cellstream), so
-# these run only on a GPU host with shardad installed. That is precisely why they
+# these run only on a GPU host with cellstream installed. That is precisely why they
 # exist: the tau* accumulators are threaded differently on each path
 # (`__init__.py` carries a reference row and drops it via target_indices;
 # `_refpool.py` does not have one at all), and a shape or indexing slip there

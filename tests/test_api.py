@@ -434,6 +434,37 @@ def test_iter_kwargs_serial_and_prefetch():
     assert ss._iter_kwargs(8, 4) == {"prefetch": 4, "n_workers": 8}
 
 
+def test_missing_cellstream_import_message(monkeypatch):
+    """The missing-streaming-extra error must name BOTH installs that work.
+
+    Lives here, not in test_shard_stream.py, whose module-level
+    importorskip('cellstream') skips it precisely when cellstream is absent --
+    the one situation this message exists for. The test could therefore never
+    run in the environment it describes.
+
+    Asserts the commands in full. The previous `match="streaming"` is satisfied
+    by the extra's name alone, so it stayed green while every install command in
+    the message was rewritten. (codex, checkpoint 2.)
+
+    `sys.modules[name] = None` is the import machinery's own "this module is
+    unavailable" marker, so it raises ImportError for this one name and leaves
+    every other import alone -- unlike replacing builtins.__import__, which was
+    the previous technique and hooks every import in the interpreter for the
+    duration. Verified against a venv that HAS cellstream installed; without one
+    the guard is unfalsifiable, because the bare import already fails.
+    (Gemini review, PR #144.)
+    """
+    import sys
+    from gpudge._stream_backend import _import_cellstream
+
+    monkeypatch.setitem(sys.modules, "cellstream", None)
+    with pytest.raises(ImportError) as excinfo:
+        _import_cellstream()
+    msg = str(excinfo.value)
+    assert "pip install 'gpudge[streaming]'" in msg      # from PyPI
+    assert "pip install '.[streaming]'" in msg           # from a checkout
+
+
 def test_should_device_decode_matrix(monkeypatch):
     """_should_device_decode truth table (pure helper, no cellstream/cupy needed —
     monkeypatched). Lives here, not in test_shard_stream.py, whose module-level
