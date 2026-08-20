@@ -6,7 +6,7 @@
 # The gpudge pin is EXACT, unlike the README's `pip install gpudge`. The two are
 # for different things: someone following the README wants the current release,
 # while this file is checked in beside the code it belongs to, so unpinned,
-# `mamba env create` from a v0.9.0 checkout would install whatever PyPI has
+# `mamba env create` from a v0.9.1 checkout would install whatever PyPI has
 # latest. It is one of the files a release cut must bump, and it always has
 # been; it was pinned to a git tag before gpudge was published and stays pinned
 # now that it resolves from PyPI.
@@ -27,8 +27,8 @@
 # For the optional `de(archive=...)` streaming path, switch the extra to
 # [fast,streaming]; cellstream resolves from PyPI and needs no separate step.
 # (For GPU device decode use [fast,streaming-gpu], which adds cellstream's
-#  [gpu] extra. cellstream is the former shardad, renamed and first published
-#  at 0.9.0, which is the floor for both archive layouts.)
+#  [gpu] extra. cellstream's floor is 0.9.0, the first release carrying both
+#  archive layouts.)
 name: gpudge
 channels:
   - conda-forge
@@ -37,4 +37,4 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu126
-      - "gpudge[fast]==0.9.0"
+      - "gpudge[fast]==0.9.1"

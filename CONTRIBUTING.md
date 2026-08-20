@@ -28,10 +28,7 @@ uv venv && uv pip install --torch-backend=cu126 -e ".[dev,fast]"
 
 `uv pip install` resolves only the extras you name, and skips
 `[tool.uv.sources]` — which is why `--torch-backend=cu126` is passed explicitly.
-`uv sync` also works now; it did not before the `shardad` → `cellstream` rename,
-because `[tool.uv.sources]` then carried a private git-SSH entry that `uv sync`
-resolved even when the `streaming` extra was not requested, failing with
-`Permission denied (publickey)` for anyone without a key. `[fast]` adds numba,
+`uv sync` also works. `[fast]` adds numba,
 which the fast CSR kernel needs; `[dev]` adds pytest, ruff, scanpy and pyyaml.
 
 ## Running the tests
@@ -92,6 +89,10 @@ what was verified and what was not — "I did not run the GPU suite" is a fine
 thing to write, and much better than silence. If a reviewer's suggestion looks
 wrong to you, say why rather than applying it; several suggestions in this
 repository's history were technically reasoned and empirically false.
+
+Add yourself to `AUTHORS` in the same PR. That applies to a report, a
+measurement or a review that changed the code or a documented rule, not only to
+a patch — `AUTHORS` says so, and does not rank the two.
 
 ## Reporting a bug
 

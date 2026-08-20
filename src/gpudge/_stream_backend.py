@@ -50,6 +50,30 @@ Implementations:
 from __future__ import annotations
 
 
+def label_str(x):
+    """One group/reference label as a `str`, decoding bytes rather than repr-ing it.
+
+    `str(b"ntc")` is `"b'ntc'"` -- the Python 3 str(bytes) trap -- which would
+    reach the output frame as a label nobody wrote. `str(...)` on the str arm too:
+    `np.str_` subclasses `str` and would otherwise leak out as `np.str_`.
+
+    Module level, and used by BOTH `validate_archive_reference` and
+    `_cell_stream._cell_group_ranges`, so the two cannot disagree about what a
+    label is. It was a nested helper in the former until a review pointed out the
+    latter was missing it. (Gemini review, PR #146.)
+
+    `isinstance`, not `hasattr(x, "decode")`: a reviewer asked for duck-typing on
+    the grounds that `np.bytes_` might not inherit from `bytes`. Measured -- it
+    does. `np.bytes_.__mro__` is `(bytes_, bytes, character, flexible, generic,
+    object)`, `np.dtype("S3").type` IS `np.bytes_`, an element taken from an
+    S-dtype array satisfies `isinstance(x, bytes)`, and this function already
+    returns `'ntc'` for all of them. The concern was scoped to NumPy 1.x, which
+    `pyproject.toml` excludes anyway (`numpy>=2`). Left as isinstance, which is
+    also the more precise test. (Gemini review, PR #146.)
+    """
+    return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+
 def validate_archive_reference(reference, labels):
     """Validate ``reference=`` against an archive's OWN reference labels.
 
@@ -70,9 +94,7 @@ def validate_archive_reference(reference, labels):
     ``reference=['ntc', 'safe'] is not among the archive's reference labels
     ['ntc', 'safe']``. A sequence is now checked element-wise.
     """
-    def _label(x):
-        return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
-
+    _label = label_str          # module-level now; see label_str's docstring
     label_list = sorted(labels)
     if reference is None:
         return "|".join(label_list)
@@ -114,13 +136,14 @@ def validate_archive_reference(reference, labels):
 def _import_cellstream():
     try:
         import cellstream
-    except ImportError as e:  # pragma: no cover - exercised via monkeypatch
+    except ImportError as e:
+        # No `pragma: no cover` here: test_api.py's
+        # test_missing_cellstream_import_message reaches this branch on CPU CI.
         raise ImportError(
             "de(archive=...) requires the optional 'streaming' extra, which "
-            "installs cellstream (>=0.9.0, the former shardad) from PyPI. "
-            "Reinstall gpudge with the extra -- e.g. `pip install '.[streaming]'` "
-            "from a checkout, or add `streaming` to the pin in the README's "
-            "Install section."
+            "installs cellstream (>=0.9.0) from PyPI. "
+            "Reinstall gpudge with the extra -- `pip install 'gpudge[streaming]'`, "
+            "or `pip install '.[streaming]'` from a checkout."
         ) from e
     return cellstream
 

@@ -7,7 +7,7 @@ intermediate ``numpy.array`` shells as ~280 s of de() wall (90% of the
 remaining post-FDR-fix bottleneck). One pass + parallel-rows kernel
 removes most of that overhead.
 
-Install with ``pip install gpudge[fast]`` (or ``uv pip install -e
+Install with ``pip install 'gpudge[fast]'`` (or ``uv pip install -e
 ".[fast]"``) to enable; the extra is just ``numba``.
 """
 from __future__ import annotations

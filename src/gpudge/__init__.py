@@ -58,7 +58,7 @@ if not HAS_NUMBA:
     warnings.warn(
         "gpudge: numba is not installed; falling back to scipy "
         "for sparse CSR row slicing (~3x slower on multi-million-cell "
-        "inputs). Install with `pip install gpudge[fast]` (or "
+        "inputs). Install with `pip install 'gpudge[fast]'` (or "
         "`uv pip install -e \".[fast]\"`) to enable the numba kernel.",
         stacklevel=2,
     )
@@ -1272,11 +1272,13 @@ def de(
     labels_t = torch.from_numpy(state.labels).to(device)
 
     # Auto-pick gene chunk size from free GPU memory if not provided.
-    # Heuristic adopted from pdex's default_gene_chunk_size: working memory is
-    # dominated by ref-cell ranking buffers (~24 bytes per ref cell per gene:
-    # float32 values + int64 sort indices + float64 ranks + workspace), capped
-    # at 16 GB and 20% of free GPU memory. For all_others, ranks cover every
-    # cell (1-vs-rest semantics), so use n_cells as the budget basis instead.
+    # Heuristic adapted from `default_gene_chunk_size` in the `gpu` branch of
+    # abhinadduri/pdex -- the GPU fork, not upstream pdex; see AUTHORS. Working
+    # memory is dominated by ref-cell ranking buffers (~24 bytes per ref cell per
+    # gene: float32 values + int64 sort indices + float64 ranks + workspace),
+    # capped at 16 GB and 20% of free GPU memory. For all_others, ranks cover
+    # every cell (1-vs-rest semantics), so use n_cells as the budget basis
+    # instead.
     #
     # In ref-mode we also allocate per-chunk GPU accumulators of shape
     # (n_groups, ch) × float64. Count: arithmetic / U / p (= 3) for

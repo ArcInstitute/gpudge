@@ -44,7 +44,10 @@ run arbitrary code in the same process.
 
 ## Dependencies
 
-Third-party licences and the environment a release was audited against are
-recorded in [`docs/THIRD_PARTY_LICENSES.md`](docs/THIRD_PARTY_LICENSES.md). A
+gpudge **redistributes** no third-party code: the wheel carries only the
+`gpudge/` package and its `dist-info`, which the release workflow asserts on
+every publish. Dependencies are resolved at install time from the set declared
+in `pyproject.toml`, and each carries its own licence — in its own metadata
+where it declares one at all, which not every package on PyPI does. A
 vulnerability in a dependency is best reported upstream first; tell us too, so
 the floor can be raised here.

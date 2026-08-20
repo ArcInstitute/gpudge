@@ -46,9 +46,11 @@ def cell_mode2(tmp_path):
 
 
 def test_cell_group_ranges_shape(cell_mode1):
-    """The private cellstream group table has the shape gpudge depends on, and the
+    """cellstream's public group_spans() has the shape gpudge depends on, and the
     ranges tile [0, n_obs) with the reference leading. This test is the tripwire
-    for cellstream changing CellStore._load_groups()."""
+    for cellstream changing CellStore.group_spans(), and -- because it reads a
+    real archive -- for the manifest's `reference` drifting from the labels the
+    spans carry."""
     from gpudge._cell_stream import _cell_group_ranges
     p, adata = cell_mode1
     store = cellstream.open(p)
@@ -83,35 +85,42 @@ def test_cell_group_ranges_no_reference(cell_mode2):
 
 
 class _FakeStore:
-    """Minimal CellStore stand-in for the guard tests."""
+    """Minimal CellStore stand-in for the guard tests.
+
+    ``groups`` is a list of ``(label, start, stop)`` triples, handed back as real
+    ``cellstream.GroupSpan`` values so the fake cannot drift from the type the
+    store actually returns -- a plain tuple would keep passing after GroupSpan
+    grew a field or stopped unpacking.
+    """
     path = "<fake>"
 
     def __init__(self, groups, reference, n_obs):
-        self._groups = {"reference": reference, "groups": groups}
+        self._spans = [cellstream.GroupSpan(*g) for g in groups]
+        self.manifest = {"reference": reference}
         self.n_obs = n_obs
 
-    def _load_groups(self):
-        return self._groups
+    def group_spans(self):
+        return list(self._spans)
 
 
 @pytest.mark.parametrize("groups, reference, n_obs, match", [
     # gap between two groups
-    ([{"label": "a", "start": 0, "stop": 5},
-      {"label": "b", "start": 7, "stop": 10}], None, 10, "tile"),
+    ([("a", 0, 5), ("b", 7, 10)], None, 10, "tile"),
     # overlap
-    ([{"label": "a", "start": 0, "stop": 5},
-      {"label": "b", "start": 3, "stop": 10}], None, 10, "tile"),
+    ([("a", 0, 5), ("b", 3, 10)], None, 10, "tile"),
     # ranges stop short of n_obs
-    ([{"label": "a", "start": 0, "stop": 5}], None, 10, "cover"),
-    # duplicate label
-    ([{"label": "a", "start": 0, "stop": 5},
-      {"label": "a", "start": 5, "stop": 10}], None, 10, "duplicate"),
+    ([("a", 0, 5)], None, 10, "cover"),
+    # duplicate label -- cellstream ALLOWS these (several records can share a
+    # stringified label); gpudge cannot. Not because the spans collapse:
+    # _targets keeps BOTH, while _tgt_index resolves both to the LAST, so one
+    # accumulator row is never written and the other is overwritten span by
+    # span. See _cell_group_ranges. (Copilot review, PR #146.)
+    ([("a", 0, 5), ("a", 5, 10)], None, 10, "duplicate"),
     # reference label absent from the group table
-    ([{"label": "a", "start": 0, "stop": 10}], "zzz", 10, "not in the group table"),
+    ([("a", 0, 10)], "zzz", 10, "not in the group table"),
     # reference group is NOT leading -- cellstream's read_reference() would gather
     # [0, ref_stop) and silently pull group 'a' into the reference pool
-    ([{"label": "a", "start": 0, "stop": 5},
-      {"label": "ntc", "start": 5, "stop": 10}], "ntc", 10, "leading"),
+    ([("a", 0, 5), ("ntc", 5, 10)], "ntc", 10, "leading"),
     # empty group table
     ([], None, 0, "no group table"),
 ])
@@ -121,30 +130,115 @@ def test_cell_group_ranges_guards(groups, reference, n_obs, match):
         _cell_group_ranges(_FakeStore(groups, reference, n_obs))
 
 
-def test_cell_group_ranges_private_api_gone():
-    """A cellstream that drops _load_groups() must fail loudly, not silently."""
+@pytest.mark.parametrize("manifest", [None, object(), 42],
+                         ids=["none", "no-get", "not-a-mapping"])
+def test_cell_group_ranges_bad_manifest_is_wrapped(manifest):
+    """A `manifest` that is not a mapping lands in the SAME wrapper as a broken
+    group_spans(), because one try covers both -- so the message has to name both
+    surfaces. Before it did, this case reported that group_spans() had not
+    returned the expected spans, blaming the call that succeeded.
+    (Gemini review, PR #146.)"""
+    from gpudge._cell_stream import _cell_group_ranges
+
+    class _BadManifest:
+        path = "<fake>"
+        n_obs = 10
+
+        def group_spans(self):
+            return [cellstream.GroupSpan("a", 0, 10)]
+
+    store = _BadManifest()
+    store.manifest = manifest
+    with pytest.raises(RuntimeError, match="manifest"):
+        _cell_group_ranges(store)
+
+
+def test_cell_group_ranges_without_path_still_explains():
+    """A store lacking `path` must still get the explanatory error.
+
+    Every message in _cell_group_ranges names the archive, and each one used to
+    read `store.path` directly. On a store whose contract has moved far enough to
+    drop it that raised a bare AttributeError instead -- in the except block it
+    would additionally have masked the original exception. They all route through
+    one getattr-computed local now, so the guard still speaks.
+    (Gemini review, PR #146.)"""
+    from gpudge._cell_stream import _cell_group_ranges
+
+    class _NoPath:                          # deliberately no `path`
+        n_obs = 10
+        manifest = {"reference": None}
+
+        def group_spans(self):              # a gap: does not tile [0, n_obs)
+            return [cellstream.GroupSpan("a", 0, 4),
+                    cellstream.GroupSpan("b", 6, 10)]
+
+    with pytest.raises(ValueError, match="<unknown>.*tile"):
+        _cell_group_ranges(_NoPath())
+
+
+def test_cell_group_ranges_decodes_bytes_labels():
+    """A bytes label must decode, not stringify to "b'ntc'".
+
+    `str(b"ntc")` is the Python 3 str(bytes) trap: the label would reach the
+    output frame as a name nobody wrote, and the reference-membership comparison
+    would be made between two reprs. Upstream types labels as `str`, so this is
+    contract insurance -- but BOTH sides of that comparison (the spans and the
+    manifest's reference) now normalize through the same `label_str` helper, and
+    this pins it. (Gemini review, PR #146.)"""
+    from gpudge._cell_stream import _cell_group_ranges
+
+    ref_labels, ranges = _cell_group_ranges(
+        _FakeStore([(b"ntc", 0, 4), (b"A", 4, 10)], b"ntc", 10))
+    assert ref_labels == ["ntc"]
+    assert ranges == [("ntc", 0, 4), ("A", 4, 10)]
+
+
+def test_cell_group_ranges_public_api_gone():
+    """A cellstream that drops group_spans() must fail loudly, not silently."""
     from gpudge._cell_stream import _cell_group_ranges
 
     class _NoGroups:
         path = "<fake>"
         n_obs = 10
+        manifest = {"reference": None}
 
-    with pytest.raises(RuntimeError, match="_load_groups"):
+    with pytest.raises(RuntimeError, match="group_spans"):
         _cell_group_ranges(_NoGroups())
 
 
 @pytest.mark.parametrize("bad", [
-    {"start": 0, "stop": 5},                       # missing 'label'
-    {"label": "a", "stop": 5},                     # missing 'start'
-    {"label": "a", "start": 0, "stop": "five"},    # non-numeric bound
-], ids=["no-label", "no-start", "bad-bound"])
-def test_cell_group_ranges_malformed_record_is_wrapped(bad):
-    """A malformed group RECORD is the same class of failure as the table
-    changing shape, and must get the same explanatory RuntimeError rather than
-    a bare KeyError/ValueError escaping a list comprehension."""
+    ("a", 0),                       # too few values to unpack -> ValueError
+    ("a", 0, 5, 7),                 # too many -> ValueError
+    ("a", 0, "five"),               # non-numeric bound -> ValueError from int()
+    ("a", 0, float("inf")),         # non-finite bound -> OverflowError from int()
+    None,                           # not iterable at all -> TypeError
+], ids=["short", "long", "bad-bound", "inf-bound", "not-a-span"])
+def test_cell_group_ranges_malformed_span_is_wrapped(bad):
+    """A malformed SPAN is the same class of failure as group_spans() itself
+    changing shape, and must get the same explanatory RuntimeError rather than a
+    bare TypeError/ValueError escaping a list comprehension.
+
+    Uses a raw list rather than _FakeStore. GroupSpan is a NamedTuple, so its
+    annotations reject nothing -- `GroupSpan("a", 0, "five")` constructs fine --
+    but the arity cases cannot be built through it at all, so the fake would
+    raise in its own constructor rather than in the code under test. The guard is
+    for a cellstream whose contract has moved, not for one that is behaving.
+
+    `inf-bound` is the case that motivated widening the except clause: `int()`
+    raises OverflowError, not ValueError, on a non-finite float, so before that
+    widening this input escaped the wrapper entirely. (codex.)"""
     from gpudge._cell_stream import _cell_group_ranges
-    with pytest.raises(RuntimeError, match="_load_groups"):
-        _cell_group_ranges(_FakeStore([bad], None, 5))
+
+    class _BadSpans:
+        path = "<fake>"
+        n_obs = 5
+        manifest = {"reference": None}
+
+        def group_spans(self):
+            return [bad]
+
+    with pytest.raises(RuntimeError, match="group_spans"):
+        _cell_group_ranges(_BadSpans())
 
 
 def test_plan_batches_groups_are_never_split():
@@ -509,9 +603,9 @@ def _write_shard(adata, path, *, group_by, reference):
 def twin_mode1(tmp_path):
     """The SAME AnnData written both ways, with DEFAULT ordering.
 
-    Default ordering was load-bearing under the old shardad v0.7.1 pin: its cell
+    Default ordering was load-bearing under the pre-0.8.0 writer: its cell
     writer converted categorical sort keys with .to_numpy() (losing category
-    order) where the shard writer used .values (shardad #252), so a categorical
+    order) where the shard writer used .values (cellstream #252), so a categorical
     sort_within_group ordered rows differently between layouts and moved the
     float64 group means. Fixed upstream in 0.8.0, below the >=0.9.0 floor. The
     fixture keeps default ordering anyway: it is what the twin-mode exactness

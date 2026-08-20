@@ -57,7 +57,7 @@ jobs:
           set -euo pipefail
           expected=$(printf '%s\n' \
             .gemini .github .gitignore .python-version \
-            CHANGELOG.md CITATION.cff CODE_OF_CONDUCT.md CONTRIBUTING.md \
+            AUTHORS CHANGELOG.md CITATION.cff CODE_OF_CONDUCT.md CONTRIBUTING.md \
             LICENSE PKG-INFO README.md SECURITY.md \
             benchmarks docs environment.yml examples pyproject.toml src tests \
             | sort)
@@ -101,5 +101,186 @@ jobs:
           [ "$tag" = "$built" ] || {
             echo "::error::tag $GITHUB_REF_NAME does not match built version $built"; exit 1; }
           echo "tag and built version agree: $built"
+
+      # Four files carry the release version independently of pyproject.toml --
+      # CITATION.cff, CHANGELOG.md, environment.yml, README.md -- and nothing
+      # used to check any of them: CITATION.cff silently shipped `0.8.0` INSIDE
+      # the 0.9.0 release, because "these files move together" lived only in a
+      # human's head. Asserted here instead.
+      #
+      # The two YAML files are PARSED and the two Markdown files are matched as
+      # whole lines. Both decisions are findings rather than preferences: three
+      # rounds of review produced file contents that passed a text-matching
+      # draft of this step while publishing the wrong thing.
+      #
+      #   grep -F     matched a version named in a COMMENT while the real pin
+      #               sat one release behind.
+      #   grep -c     counts matching LINES, so an exact heading string buried
+      #               in a sentence of prose read as the heading.
+      #   digits      a date checked for SHAPE let `2026-02-31` through, and
+      #               `fromisoformat` alone lets `20260820` through -- it
+      #               canonicalises, and CFF 1.2 wants the dashes.
+      #   ERE         interpolating a version into a regex breaks on the `+`
+      #               that PEP 440 permits.
+      #   .strip()    made the checks indentation-blind, so a pin de-indented
+      #               out of the `pip:` block (where it installs nothing) and a
+      #               heading indented into a code block both passed.
+      #   startswith  a duplicate `"version":` key, which YAML resolves to the
+      #               LAST value, hid behind the first one being right.
+      #   substring   counting occurrences of the install pin accepted one
+      #               inside an HTML comment, with none left in the document.
+      #   truthiness  an emptied or fully-commented-out YAML file parses to
+      #               None, and a bare `{}` parses to an empty mapping; both are
+      #               falsy, and both skipped their structural check entirely.
+      #   `.*?-->`    an HTML comment opener with the closer forgotten hides the
+      #               rest of the document when rendered and stripped nothing.
+      #
+      # Every one of those was demonstrated against this step. (Codex review,
+      # gpudge_arc#149.)
+      - name: The other files that carry the version agree with it
+        run: |
+          set -euo pipefail
+          uv run --with pyyaml --no-project python - <<'PY'
+          import glob, re, sys
+          from datetime import date
+          from pathlib import Path
+
+          import yaml
+
+          fail = []
+
+          class Strict(yaml.SafeLoader):
+              """Rejects duplicate keys, which SafeLoader resolves to the last."""
+
+          def _no_dupes(loader, node, deep=False):
+              seen = set()
+              for k, _ in node.value:
+                  key = loader.construct_object(k, deep=deep)
+                  if key in seen:
+                      raise yaml.YAMLError(f"duplicate key {key!r}")
+                  seen.add(key)
+              return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+          Strict.add_constructor(
+              yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_dupes)
+
+          def load(name):
+              """A mapping, or None with the reason already recorded.
+
+              Everything that is not a mapping is a failure, `None` included: an
+              emptied or fully-commented-out file parses to None, and letting
+              that through skipped the whole structural check below. Callers
+              test `is not None`, not truthiness -- `{}` is a mapping, parses
+              from a plain `{}`, and is falsy, which skipped the check just the
+              same.
+              """
+              try:
+                  doc = yaml.load(Path(name).read_text(encoding="utf-8"), Strict)
+              except yaml.YAMLError as exc:
+                  fail.append(f"{name} is not valid YAML: {exc}")
+                  return None
+              if not isinstance(doc, dict):
+                  fail.append(f"{name} did not parse to a mapping, got {type(doc).__name__}")
+                  return None
+              return doc
+
+          def lines(name):
+              return Path(name).read_text(encoding="utf-8").splitlines()
+
+          sdists = sorted(glob.glob("dist/*.tar.gz"))
+          if len(sdists) != 1:
+              print(f"::error::want exactly one dist/*.tar.gz, found {len(sdists)}: {sdists}")
+              sys.exit(1)
+          stem = Path(sdists[0]).name.removesuffix(".tar.gz")
+          if not stem.startswith("gpudge-"):
+              print(f"::error::cannot read a version out of {sdists[0]}")
+              sys.exit(1)
+          v = stem[len("gpudge-"):]
+
+          # CITATION.cff, as a citation consumer sees it. `date-released` is a
+          # date in CFF, so an unquoted value parses to a date object; a quoted
+          # one must be the canonical YYYY-MM-DD, which is what CFF 1.2 asks for
+          # and is stricter than `fromisoformat`, whose 3.11+ form also accepts
+          # `20260820` and `2026-W34-4` and quietly canonicalises them.
+          cff, cff_date = load("CITATION.cff"), None
+          if cff is not None:
+              if str(cff.get("version")) != v:
+                  fail.append(f"CITATION.cff version is {cff.get('version')!r}, want {v}")
+              raw = cff.get("date-released")
+              if isinstance(raw, date):
+                  cff_date = raw.isoformat()
+              else:
+                  try:
+                      parsed = date.fromisoformat(str(raw)).isoformat()
+                  except (ValueError, TypeError) as exc:
+                      fail.append(f"CITATION.cff date-released {raw!r} is not a real date: {exc}")
+                  else:
+                      if parsed != str(raw):
+                          fail.append(f"CITATION.cff date-released {raw!r} is not written as {parsed}")
+                      else:
+                          cff_date = parsed
+
+          # environment.yml: the pin has to be in the PIP list. Checked
+          # structurally because a pin de-indented into the conda list is still
+          # a well-formed list entry -- it just never installs gpudge.
+          env = load("environment.yml")
+          want = f"gpudge[fast]=={v}"
+          if env is not None:
+              pips = [item["pip"] for item in env.get("dependencies") or []
+                      if isinstance(item, dict) and "pip" in item]
+              if len(pips) != 1:
+                  fail.append(f"environment.yml has {len(pips)} pip: blocks, want exactly 1")
+              elif [r for r in pips[0] if r == want] != [want]:
+                  fail.append(f"environment.yml pip: block does not carry exactly one {want!r}: {pips[0]}")
+
+          # And no OTHER version pinned anywhere in either file, including in a
+          # comment a parser cannot see. Every occurrence is extracted and
+          # compared: deciding per LINE pardoned a stale pin sitting in a
+          # trailing comment beside the right one, and a substring test let
+          # `==0.9.10` satisfy a check for `==0.9.1`.
+          for name in ("environment.yml", "README.md"):
+              found = re.findall(r"gpudge\[fast\]==([0-9A-Za-z._!+-]*)",
+                                 Path(name).read_text(encoding="utf-8"))
+              other = sorted({f for f in found if f != v})
+              if other:
+                  fail.append(f"{name} pins gpudge[fast] at {other} as well as {v}")
+
+          # The changelog heading, whole-line and UNINDENTED: `.strip()` accepts
+          # four leading spaces, which CommonMark renders as a code block, so the
+          # release's sections would stay under Unreleased.
+          if cff_date:
+              want_h = f"## [{v}] \u2014 {cff_date}"
+              n = sum(1 for ln in lines("CHANGELOG.md") if ln == want_h)
+              if n != 1:
+                  fail.append(f"want exactly one unindented CHANGELOG heading {want_h!r}, found {n}")
+
+          # README's install pin is the one version in this tree NOT edited by
+          # hand: the mirror build substitutes it from a version argument typed
+          # on the command line, so it can name a different tag while every
+          # hand-edited file agrees -- and it is the line readers copy. HTML
+          # comments are stripped first: the pin has to be in the document a
+          # reader sees, and commenting the install block out (delimiters on
+          # their own lines, pin untouched) satisfied a plain line match. An
+          # opener runs to `-->` OR to end of file, because that is what
+          # CommonMark does with an unclosed one -- and `.*?-->` strips nothing
+          # at all when the closer was forgotten.
+          text = re.sub(r"<!--.*?(?:-->|\Z)", "",
+                        Path("README.md").read_text(encoding="utf-8"), flags=re.S)
+          want_pin = f'"gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v{v}"'
+          n = sum(1 for ln in text.splitlines() if ln.strip() == want_pin)
+          total = text.count("ArcInstitute/gpudge.git@")
+          if n != 1 or total != 1:
+              fail.append(
+                  f"README.md: want exactly one uncommented line {want_pin} and no "
+                  f"other 'ArcInstitute/gpudge.git@'; found {n} and {total}. The "
+                  f"mirror build's version argument disagrees with the tag")
+
+          for f in fail:
+              print(f"::error::{f}")
+          if fail:
+              sys.exit(1)
+          print(f"version parity ok: {v}, dated {cff_date}, in CITATION.cff, "
+                f"CHANGELOG.md, environment.yml and README.md")
+          PY
 
       - uses: pypa/gh-action-pypi-publish@release/v1

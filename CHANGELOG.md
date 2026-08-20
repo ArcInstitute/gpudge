@@ -5,6 +5,12 @@ All notable changes to gpudge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> Entries before 0.9.0 call the optional streaming dependency **`shardad`**. That
+> is the same package now published as
+> [`cellstream`](https://github.com/ArcInstitute/cellstream); it was renamed when
+> it went to PyPI in 0.9.0. Those entries keep the name they were written with
+> rather than being rewritten.
+
 > **A note on issue and PR numbers.** References such as `#124`, `gpudge_arc#115`
 > and `shardad #246` throughout this file are **provenance, not links**: they
 > identify entries in issue trackers that are not public, and will not resolve
@@ -12,6 +18,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > discussion that produced it.
 
 ## [Unreleased]
+
+## [0.9.1] — 2026-08-20
+
+### Changed
+
+- **`de(archive=…, layout='cell')` no longer reaches into cellstream's private
+  `CellStore._load_groups()`.** It reads the public `group_spans()` that
+  cellstream 0.8.0 added for exactly this (`shardad #248`), plus the manifest's
+  `reference` — which loading the spans validates against groups.json's own copy,
+  so the two cannot disagree. Behaviour is unchanged: same group table, same
+  guards, same messages apart from the one that named the accessor. Verified on
+  real archives in both reference modes that `group_spans()` returns the private
+  records element-for-element and that the manifest's `reference` matches
+  groups.json's. (`gpudge_arc#139`)
+
+  gpudge still **rejects duplicate group labels**, which cellstream explicitly
+  permits — under the default sort order, distinct raw obs values that are equal
+  once stringified produce several records carrying one label, which is why
+  `group_spans()` returns a list rather than a mapping. For a *target* label that
+  is a wrong answer, and not by collapsing the spans: the target list keeps both
+  entries while the label→index map resolves both to the last, so one result row
+  is never written and the other is overwritten span by span. For a *reference*
+  label the rejection is stricter than necessary — duplicates are handled
+  correctly downstream — and is left in place deliberately, that path having no
+  fixture; loosening it is a follow-up, not part of this change.
+
+  `reference_row_count()` is deliberately **not** used. The label split has to
+  happen regardless, and deriving the reference block's end from the same table
+  keeps the two consistent by construction rather than by agreement.
+
+### Added
+
+- **`AUTHORS`**, a curated credit record. `git shortlog` describes this project
+  badly — squash merges collapse each pull request into one author entry, a shape
+  that cannot represent a review, a report or prior art, and the contribution
+  that matters most here arrived as exactly those rather than as patches. It
+  credits the GPU fork of pdex (`abhinadduri/pdex@gpu`) as
+  the work that demonstrated the idea gpudge is built on, and from which gpudge
+  adopted both the `gpu_gene_chunk_size` parameter name and the shape of its
+  automatic gene-chunk sizer. The attribution comment at that call site said
+  "pdex", which read as upstream; upstream pdex has no such function, and the
+  comment now names the fork.
+
+  It also records a production evaluation by someone other than this library's
+  author: gpudge was adopted as the default DE engine in a production single-cell
+  QC pipeline, with close log2-fold-change agreement against CPU pdex reported on
+  real data at production scale. The entry states the correspondence that makes
+  the two comparable — on log1p input pdex's means are `expm1` of gpudge's
+  *arithmetic* means, and log2FC must be recomputed from those, because
+  arithmetic-mode `log2_fold_change` is a ratio of the untransformed means.
+
+  A `.mailmap` accompanies it so identity counts over the private history are
+  correct. It is development-only and is not part of a release.
+
+### Removed
+
+- **`docs/THIRD_PARTY_LICENSES.md`.** It was a dated audit of one resolved
+  dependency environment, and gpudge **redistributes** no third-party code — the
+  wheel carries only the `gpudge/` package, which the release workflow asserts on
+  every publish — so there was no notice obligation for the file to discharge.
+  What it did instead was restate, less authoritatively, what each dependency
+  declares in its own metadata. And not every package declares anything:
+  `pyfastpfor`, a transitive dependency of the streaming extra's `[cell]` variant,
+  publishes an sdist with no licence file at all, which is the kind of row a
+  point-in-time table records once and then cannot keep true. It had also gone materially
+  stale: its rows described the streaming dependency under a name and a version
+  that no longer exist, and refreshing them meant reproducing a 93-package
+  point-in-time resolve rather than editing text. `SECURITY.md` now states the
+  actual situation instead of linking to it.
+
+  The mirror pipeline loses two things with it: a fixup rule that de-sited the
+  audit's regeneration recipe, and — more usefully — the last exception in
+  `leak_check.py`'s SSH-URL check, which was scoped to that one file. A GitHub
+  SSH URL anywhere in the published tree is now a leak with no exception at all —
+  as this very entry discovered, having first been written with a literal one in
+  it.
+
+### Fixed
+
+- **`de(archive=…)`'s missing-dependency error gave dated install advice.** It
+  told the caller to run `pip install '.[streaming]'` *from a checkout*, because
+  the bare PyPI name still resolved to the reservation stub. gpudge is on PyPI
+  as of 0.9.0, so the message now leads with `pip install 'gpudge[streaming]'`
+  and keeps the checkout form as the alternative. Deferred from the 0.9.0
+  release review rather than re-cutting the tag.
+
+- **Two install hints were unquoted.** `pip install gpudge[fast]`, as printed by
+  the no-numba warning and by `_csr_dense`'s module docstring, is a glob pattern
+  to zsh — the default shell on macOS — which fails with `no matches found`
+  rather than installing anything. Both now quote the argument.
+
+- **The pre-release GPU gate now reports what it actually measured.** Its first
+  run ever to reach the test suite passed every case on an unpinned `[dev,fast]`
+  resolve on an L4 and still reported failure, on two faults in the gate's own
+  harness rather than anything in the library: a correct new skip its verdict
+  allow-list had not been told about, and one artifact copy that failed
+  transiently with the reason discarded. Reviewing that fix surfaced two further
+  faults that had never been observed — the retrieval loop leaked a non-zero
+  status, and its error-reporting path could end the run at SIGPIPE before the
+  verdict or the diagnostics were written. All four are fixed and the loop now
+  has unit tests driven against the gate implementation itself rather than a
+  copy of it.
+
+  This is the machinery that decides whether a release may happen; the gate
+  implementation itself is deliberately not part of any distribution.
+  (`gpudge_arc#147`)
+
+- **The streaming extra's missing-dependency error no longer names a package that
+  no longer exists.** It read "installs cellstream (>=0.9.0, the former
+  shardad)"; the parenthetical helped nobody who had hit the error, and named a
+  repository the reader cannot see. The same aside appeared across the prose — the
+  install documentation, two packaging comments and a CI comment each explained a
+  pre-rename `[tool.uv.sources]` git-SSH entry that broke `uv sync`, a failure
+  impossible on any supported version now that the floor is cellstream 0.9.0 and
+  that entry is gone. All removed.
+
+- **`CITATION.cff` said `0.8.0` while 0.9.0 was being published**, so anyone who
+  cited this library from its own metadata cited the wrong release. Corrected,
+  and the publishing workflow now asserts it rather than trusting that "these
+  files move together": four files carry the release version independently of
+  `pyproject.toml`, and nothing checked any of them.
+
+  The two YAML files are **parsed** — with a loader that rejects duplicate keys,
+  and a structural search for the pin inside the `pip:` block — and the two
+  Markdown files are matched as whole lines, the changelog heading unindented
+  and the README pin after HTML comments are stripped out. Those decisions are
+  findings rather than preferences. Three rounds of review produced file
+  contents that passed a text-matching draft of this check while publishing the
+  wrong thing:
+
+  - a version named in a *comment* while the real pin sat one release behind,
+    and a stale pin in a trailing comment beside the correct one;
+  - the install pin inside an *HTML comment*, with none left in the document a
+    reader sees — and then the same pin under an *unclosed* comment opener,
+    which hides the rest of the page when rendered while `<!--.*?-->` strips
+    nothing at all;
+  - an exact heading string buried inside a sentence of prose, because `grep -c`
+    counts matching *lines*;
+  - a heading indented four spaces, which renders as a code block, so the
+    release's sections stay under `Unreleased`;
+  - a date checked for digit shape, so `2026-02-31` passed — and, once parsing
+    replaced the shape check, `20260820`, because `date.fromisoformat` accepts
+    it and canonicalises it while CFF wants the dashes;
+  - a duplicate `"version":` key, which YAML resolves to the *last* value,
+    hidden behind a first one that was right;
+  - the pin de-indented out of the `pip:` block, where it is still a well-formed
+    list entry and installs nothing;
+  - an emptied, fully-commented-out file, which parses to `None`, and a bare
+    `{}`, which parses to an empty mapping — both falsy, both skipping their
+    structural check entirely, and the second introduced by the fix for the
+    first;
+  - `==0.9.10` satisfying a check for `==0.9.1`, twice, in two different checks.
+
+  Interpolating a version into a regular expression fails on a different axis —
+  the `+` that PEP 440 permits. Every one of those was demonstrated against this
+  check rather than argued about, and each is now a case that fails.
+
+  `README.md` is checked because it holds the install pin readers copy, and in
+  the published tree that version is the one thing *not* hand-edited: the mirror
+  build substitutes it from a version argument typed on the command line, so it
+  can name a different tag while every hand-edited file agrees. (`gpudge_arc#149`)
 
 ## [0.9.0] — 2026-08-19
 
@@ -905,8 +1072,8 @@ Distribution remains **Arc-internal** — install from the `v0.3.0` git tag
 
 - First CI workflow (`.github/workflows/ci.yml`): `ruff` + CPU `pytest` on every
   push / PR (ubuntu-latest, Python 3.12). Installs via
-  `uv pip install -e ".[dev,fast]"` so the private shardad git-SSH source is
-  never resolved on the runner; GPU (`needs_cuda`), shardad streaming
+  `uv pip install -e ".[dev,fast]"` so the streaming dependency's git-SSH source
+  is never resolved on the runner; GPU (`needs_cuda`), streaming
   (`importorskip`), and real-data tests auto-skip. The `ruff` gate is blocking;
   the repo was brought to zero lint errors (47 fixed). Green at 121 passed /
   53 skipped. (#53)
@@ -1089,11 +1256,12 @@ ULP of the CPU baseline on every assertable column.
   until shardad v0.3 lands an on-GPU read path.
 
 <!-- Compare links resolve against this repository, which is published as
-     milestone snapshots: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.7.0, 0.8.0 and 0.9.0 are
+     milestone snapshots: 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.7.0, 0.8.0, 0.9.0 and 0.9.1 are
      tagged here. The versions between them are documented above but are not
      separately tagged here, so they carry no compare link. -->
 
-[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ArcInstitute/gpudge/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/ArcInstitute/gpudge/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/ArcInstitute/gpudge/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ArcInstitute/gpudge/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ArcInstitute/gpudge/compare/v0.3.1...v0.7.0

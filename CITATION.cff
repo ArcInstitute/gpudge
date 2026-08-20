@@ -13,8 +13,8 @@ authors:
   - family-names: Dobin
     given-names: Alexander
     affiliation: "Arc Institute"
-version: 0.8.0
-date-released: "2026-08-18"
+version: 0.9.1
+date-released: "2026-08-20"
 license: MIT
 repository-code: "https://github.com/ArcInstitute/gpudge"
 keywords:

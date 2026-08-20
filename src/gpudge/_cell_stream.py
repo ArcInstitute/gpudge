@@ -7,7 +7,7 @@ import numpy as np
 
 from ._ingest import reject_missing_group_labels
 from ._csr_dense import csr_row_sums
-from ._stream_backend import validate_archive_reference
+from ._stream_backend import label_str, validate_archive_reference
 
 logger = logging.getLogger(__name__)
 
@@ -67,42 +67,107 @@ def _plan_batches(ranges, *, bytes_per_row, target_bytes=None):
 def _cell_group_ranges(store):
     """``(reference_labels | None, [(label, start, stop), ...])`` for a CellStore.
 
-    Reads cellstream's **private** ``CellStore._load_groups()``. That upstream
-    ask has since been answered: cellstream 0.8.0 added public
-    ``CellStore.group_spans()`` (a list of ``GroupSpan(label, start, stop)``) and
-    ``CellStore.reference_row_count()``, which give exactly this table without
-    loading obs. Migrating to them is tracked separately and is a cleanup, not a
-    fix -- the private call still exists in the pinned 0.9.0 and the suites pass
-    against it. Until then the reasoning below is history, not a live claim: run-detection
-    over ``store.obs[group_by]`` would load the whole obs DataFrame --
-    36 columns x 1.27 M rows on a production archive -- to recover a table the
-    archive already stores, which is why the private reach-in was taken; ``test_cell_group_ranges_private_api_gone`` makes
-    its removal fail loudly rather than silently.
+    Reads cellstream's **public** ``CellStore.group_spans()`` -- every group's
+    ``[start, stop)`` row range in storage order -- plus the manifest's
+    ``reference``. gpudge used to reach into the private ``_load_groups()``
+    because no public equivalent existed; cellstream 0.8.0 added one (upstream
+    #248) and the ``>=0.9.0`` floor makes it always available.
+    ``test_cell_group_ranges_public_api_gone`` makes its removal fail loudly
+    rather than silently. Neither call reads obs: run-detection over
+    ``store.obs[group_by]`` would load the whole DataFrame -- 36 columns x 1.27 M
+    rows on a production archive -- to recover a table the archive already stores.
 
-    Validates what cellstream's own ``read_reference()`` silently assumes: the
-    reference groups lead contiguously from row 0, so its ``[0, max stop)``
-    gather cannot pull target cells into the reference pool.
+    ``reference_row_count()`` is deliberately NOT used as the source of the
+    reference block's end. The label split below has to happen regardless, and
+    deriving both from one table makes them consistent by construction instead
+    of by agreement.
+
+    **Duplicate labels are rejected, and upstream declares them LEGAL.** Under
+    the default sort order, distinct raw obs values that stringify identically
+    produce several records carrying one label -- which is exactly why
+    ``group_spans()`` returns a list and not a mapping. For a **target** label
+    gpudge genuinely cannot handle it, and the mechanism is worth stating
+    precisely because it is not "the spans collapse into one group":
+    ``_CellBackend._targets`` keeps BOTH entries, while
+    ``_tgt_index = {lab: i for i, lab in enumerate(...)}`` maps both to the LAST
+    of them. So one accumulator row is never written at all and the other is
+    overwritten span by span, leaving the final span's subset -- a wrong answer in
+    two rows rather than a short read in one.
+
+    For a **reference** label the rejection is stricter than it needs to be:
+    duplicate reference spans are handled correctly downstream
+    (``_ref_stop`` takes the max stop, and ``_target_ranges`` excludes every
+    reference-labelled span), so gpudge could accept them. It does not, because
+    that path has no fixture and no coverage, and loosening it is not what this
+    change is for. Tracked as a follow-up rather than done here.
+
+    The tiling, coverage and reference-prefix checks below are kept, but they are
+    **future-contract assertions, not live cross-checks**: ``group_spans()``
+    routes through ``_load_groups()``, which runs cellstream's own
+    ``_validate_groups_record`` first, so against any real cellstream >=0.9.0
+    store a violation raises ``IncompatibleSchemaError`` upstream and these can
+    never fire. They exist so that a cellstream which stops validating fails here
+    instead of silently mis-slicing, and the fake-store tests exercise that
+    fallback -- not a production path. What IS load-bearing today is the call
+    ORDER: validation-before-use, not merely reading the manifest second.
     """
-    # The per-record parse is INSIDE the try: a record missing 'label'/'start'/
-    # 'stop', or carrying a non-numeric bound, is the same class of failure as
-    # the table itself changing shape, and should get the same explanatory
-    # error rather than a bare KeyError/ValueError from a list comprehension.
+    # One `where` for every message below, computed with getattr and therefore
+    # incapable of raising: a store whose contract has moved far enough may not
+    # carry `path`, and `store.path` inside the except block would replace the
+    # explanation with "during handling of the above exception, another exception
+    # occurred" -- while the same access in the ValueError paths would raise a
+    # bare AttributeError instead of the error those paths exist to give. Doing
+    # it once is also how the two stay consistent; being defensive in the except
+    # block alone was a half-measure. (Gemini review, PR #146.)
+    where = getattr(store, "path", "<unknown>")
+
+    # The per-span parse is INSIDE the try: a span that does not unpack into
+    # three values, or carries a non-numeric bound, is the same class of failure
+    # as the method disappearing, and should get the same explanatory error
+    # rather than a bare TypeError/ValueError from a list comprehension.
     try:
-        rec = store._load_groups()
-        raw = rec["groups"]
-        ref = rec["reference"]
-        ranges = [(str(g["label"]), int(g["start"]), int(g["stop"])) for g in raw]
-    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        # label_str, not str(): a bytes label would become "b'ntc'" and reach the
+        # output frame as a label nobody wrote. Upstream types labels as `str`, so
+        # this is contract insurance rather than a live case -- but both sides of
+        # the comparison below have to normalize the same way, and they now share
+        # one helper. (Gemini review, PR #146.)
+        ranges = [(label_str(lab), int(start), int(stop))
+                  for lab, start, stop in store.group_spans()]
+        # AFTER group_spans(): loading the spans is what type-checks the
+        # manifest's 'reference' and cross-checks it against groups.json's own
+        # copy, so reading it first would read an unvalidated value.
+        #
+        # `.get`, not `["reference"]`, and that is deliberate -- a reviewer asked
+        # for the subscript so a missing key would fail loudly. Measured instead:
+        # a cell archive with NO reference and no `reference` key is VALID
+        # upstream (group_spans() returns its spans), so the subscript would
+        # refuse a good archive; and an archive that DOES have a reference but
+        # whose manifest lost the key already raises IncompatibleSchemaError from
+        # _validate_groups_record's manifest-vs-groups.json check, above, so the
+        # silent-misread this would guard against cannot reach here.
+        # (Copilot review, PR #146.)
+        ref = store.manifest.get("reference")
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as e:
+        # OverflowError is in the tuple because `int(float("inf"))` raises it
+        # rather than ValueError, so an inf-bounded span would otherwise escape
+        # this wrapper. NaN is NOT such a case -- `int(float("nan"))` raises
+        # ValueError, which was already caught. (codex; corrected by Copilot.)
+        # The message names BOTH surfaces because the try covers both: a
+        # `manifest` that is None or lacks `.get` lands here too, and blaming
+        # group_spans() for it would point at the call that succeeded.
+        # (Gemini review, PR #146.)
         raise RuntimeError(
-            f"gpudge cannot read the group table of {store.path}: cellstream's "
-            f"private CellStore._load_groups() did not return the expected "
-            f"{{'reference': ..., 'groups': [...]}} shape. gpudge pins "
-            f"cellstream>=0.9.0; see gpudge _cell_stream._cell_group_ranges."
+            f"gpudge cannot read the group table of "
+            f"{where}: cellstream's "
+            f"CellStore.group_spans() did not return the expected list of "
+            f"(label, start, stop) spans, or CellStore.manifest is not a mapping. "
+            f"gpudge pins cellstream>=0.9.0; see "
+            f"gpudge _cell_stream._cell_group_ranges."
         ) from e
 
     if not ranges:
         raise ValueError(
-            f"{store.path}: cell archive has no group table (was it written "
+            f"{where}: cell archive has no group table (was it written "
             f"with group_by=?)."
         )
     labels = [lab for lab, _, _ in ranges]
@@ -111,7 +176,7 @@ def _cell_group_ranges(store):
         for lab in labels:
             (dup if lab in seen else seen).add(lab)
         raise ValueError(
-            f"{store.path}: duplicate group labels {sorted(dup)} in the group table."
+            f"{where}: duplicate group labels {sorted(dup)} in the group table."
         )
     # An unassigned cell reaches the archive as a group literally named 'nan'
     # (cellstream stringifies the obs column at write time), which the in-memory
@@ -121,37 +186,37 @@ def _cell_group_ranges(store):
     # this function exists to avoid, so the string level is the right level.
     # (ultrareview 2026-08)
     reject_missing_group_labels(
-        labels, where=str(store.path),
+        labels, where=str(where),
         remedy="Drop or assign the unassigned cells before writing the archive.")
     pos = 0
     for lab, start, stop in ranges:
         if start != pos or stop < start:
             raise ValueError(
-                f"{store.path}: group ranges do not tile [0, n_obs) -- group "
+                f"{where}: group ranges do not tile [0, n_obs) -- group "
                 f"{lab!r} is [{start}, {stop}) but the previous group ended at "
                 f"{pos}."
             )
         pos = stop
     if pos != int(store.n_obs):
         raise ValueError(
-            f"{store.path}: group ranges cover {pos} rows but the archive has "
+            f"{where}: group ranges cover {pos} rows but the archive has "
             f"{int(store.n_obs)}."
         )
 
     if ref is None:
         return None, ranges
-    ref_labels = [str(x) for x in (ref if isinstance(ref, list) else [ref])]
+    ref_labels = [label_str(x) for x in (ref if isinstance(ref, list) else [ref])]
     label_set = set(labels)          # hoisted: rebuilt per reference label otherwise
     missing = [lab for lab in ref_labels if lab not in label_set]
     if missing:
         raise ValueError(
-            f"{store.path}: the manifest names reference label(s) {missing} that "
+            f"{where}: the manifest names reference label(s) {missing} that "
             f"are not in the group table."
         )
     lead = {lab for lab, _, _ in ranges[:len(ref_labels)]}
     if lead != set(ref_labels):
         raise ValueError(
-            f"{store.path}: reference labels {sorted(ref_labels)} are not the "
+            f"{where}: reference labels {sorted(ref_labels)} are not the "
             f"leading groups (rows from 0 start with {sorted(lead)}). cellstream's "
             f"read_reference() gathers [0, max reference stop), so a non-leading "
             f"reference block would silently include target cells in the "

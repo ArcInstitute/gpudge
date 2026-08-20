@@ -10,8 +10,10 @@ name: CI
 #     tests/test_cell_stream.py, tests/test_inmem_external_ref_gpu.py) each
 #     carry a module-level `pytest.importorskip("cellstream")`, so all three files
 #     skip entirely without the optional `[streaming]` extra. Between them that
-#     is 141 cases, 70 of which need no GPU -- and since cellstream is on PyPI
-#     those 70 are now runnable on a stock runner, which wants its own job.
+#     is 147 cases, 76 of which need no GPU (measured 2026-08-20; per suite,
+#     test_shard_stream 32/37, test_cell_stream 44/8, test_inmem_external_ref_gpu
+#     0/26) -- and since cellstream is on PyPI those 76 are now runnable on a
+#     stock runner, which wants its own job.
 #   - The real-data tests (tests/test_real_data.py) skip when the dataset path
 #     is absent (it always is on CI).
 # So this job goes green on a stock CPU runner with no GPU and without the
@@ -71,17 +73,16 @@ jobs:
           cache-dependency-glob: pyproject.toml
 
       # `uv pip install` does pip-style resolution of only the requested
-      # extras. It used to be mandatory: a fresh `uv sync` resolves EVERY source
-      # in [tool.uv.sources], and that table carried a private cellstream (then
-      # shardad) git-SSH entry the no-SSH runner could not clone, even when the
-      # `streaming` extra wasn't requested. That entry is gone since the rename,
-      # so `uv sync` would work now too. torch resolves from PyPI here (the cu126
+      # extras. It used to be mandatory, back when [tool.uv.sources] carried a
+      # git-SSH entry a no-SSH runner could not clone and `uv sync` resolved every
+      # source in that table whether or not the extra was requested. That entry is
+      # gone, so `uv sync` would work now too. torch resolves from PyPI here (the cu126
       # source is skipped), which is fine: CI is CPU-only and GPU tests skip.
       # `[fast]` (numba) IS installed so the numba CSR kernel — a CPU code path —
       # is exercised rather than the scipy fallback.
       #
       # `[streaming]` is deliberately NOT installed here: this job's purpose is
-      # to prove gpudge's CORE install needs nothing optional. Covering the 70
+      # to prove gpudge's CORE install needs nothing optional. Covering the 76
       # non-CUDA cellstream cases is now possible on a stock runner and wants its
       # own job rather than widening this one.
       - name: Install dependencies

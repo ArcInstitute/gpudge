@@ -1,0 +1,83 @@
+gpudge — authors and contributors
+=================================
+
+Maintainer
+----------
+
+Alexander Dobin (@alexdobin)
+    Author and maintainer.
+
+
+Inspiration and prior art
+-------------------------
+
+Abhinav Adduri (@abhinadduri)
+    gpudge's direct inspiration is the GPU fork of pdex — [`abhinadduri/pdex`, branch
+    `gpu`](https://github.com/abhinadduri/pdex/tree/gpu), where
+    [`138335ae`](https://github.com/abhinadduri/pdex/commit/138335ae97b8) "Add CUDA backend for
+    ref-mode MWU" added `src/pdex/_torch_mwu.py` on 2026-05-19. gpudge's own design document is
+    dated two days later. That branch put reference-mode Mann–Whitney on CUDA — sorting the
+    fixed reference pool once per gene chunk and reusing it across every target group — and
+    added `mwu_backend={"auto","cpu","torch"}` and a `gpu_gene_chunk_size` knob to
+    `pdex.pdex(...)` to drive it. As of 2026-08-20 those interfaces are the fork's alone:
+    upstream pdex has no `_torch_mwu.py`, and no `mwu_backend`, `gpu_gene_chunk_size` or
+    `default_gene_chunk_size`.
+
+    gpudge took two concrete things from that branch as well as the idea. The name of the
+    `gpu_gene_chunk_size` parameter is that branch's, and so is the shape of gpudge's gene-chunk
+    sizer: a working-set estimate of ~24 bytes per reference cell per gene, capped at 16 GB and
+    at a fraction of free device memory, floored and rounded down to a multiple of 64. gpudge
+    takes 20% of free memory where the fork takes 18%, and additionally accounts for the
+    per-chunk accumulators the reference path holds resident — but it is the same heuristic,
+    adopted rather than reinvented. The attribution comment at that call site said plain "pdex",
+    which read as upstream; it now names the fork.
+
+    Thanks also for a number of useful suggestions along the way.
+
+gpudge exists to replace the parts of [pdex](https://github.com/ArcInstitute/pdex) that one
+production DE stage used, and pdex is the CPU baseline behind gpudge's parity and speedup
+claims. It is prior art in the strong sense: those numbers only mean anything because there
+was a correct, well-tested CPU implementation to measure against. (What the committed
+real-data check asserts is a bounded agreement, not bit-identity — see the tolerances in
+`tests/test_real_data.py`.)
+
+
+Production evaluation
+---------------------
+
+Kevin Feng (@kfenggg)
+    Evaluated gpudge in a production single-cell QC pipeline and adopted it as that pipeline's
+    default differential-expression engine, reporting close log2-fold-change agreement with CPU
+    pdex on real data at production scale, and a large reduction in wall time against the CPU
+    path it replaced. An evaluation run by someone other than this library's author, on data
+    and a workload chosen without reference to gpudge's own test suite, is a different kind of
+    evidence from the in-repo benchmarks — complementary to them, not a replacement.
+
+    Establishing that agreement meant working out the correspondence between the two engines,
+    which is his. On log1p input, pdex's default target and reference means are, in exact
+    arithmetic, `expm1` of gpudge's ARITHMETIC means — and log2FC then has to be recomputed
+    from those transformed means, because gpudge's arithmetic-mode `log2_fold_change` is a
+    ratio of the untransformed means and is not on pdex's scale. Arithmetic is the mode to use
+    here because of a real gpudge constraint: gpudge refuses `mean_calc="geometric"` together
+    with `ALL_OTHERS`, the rest-mean being computed by sum-subtraction, which is implemented
+    for the arithmetic case only.
+
+
+AI tooling
+----------
+
+Much of this codebase was written with Claude Code (Anthropic), and OpenAI Codex was used inside
+those same sessions to review the work before it reached human review — a deliberate
+cross-provider check, on the theory that a second model from a second vendor is harder to talk
+into agreement than the one that wrote the code. Gemini Code Assist and GitHub Copilot review
+every pull request on top of that. The development history carries `Co-Authored-By` trailers
+naming the specific Claude models.
+
+Design decisions, rulings and acceptance of every change are the maintainer's.
+
+
+Copyright
+---------
+
+Copyright (c) 2026 Arc Research Institute.
+MIT — see LICENSE.

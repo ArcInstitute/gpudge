@@ -122,7 +122,7 @@ not been released yet:
 
 ```bash
 pip install --extra-index-url https://download.pytorch.org/whl/cu126 \
-  "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.9.0"
+  "gpudge[fast] @ git+https://github.com/ArcInstitute/gpudge.git@v0.9.1"
 ```
 
 Extras:
@@ -172,11 +172,8 @@ uv venv && uv pip install --torch-backend=cu126 -e ".[dev,fast]"
 deliberately — it is CPU-only.
 
 `uv sync --extra streaming` also works and pulls the cu126 torch build from its
-pin with no manual `--extra-index-url`. (Before the `shardad` → `cellstream`
-rename this was not true: `[tool.uv.sources]` carried a private git-SSH entry
-that `uv sync` resolved even when the `streaming` extra was not requested, so it
-failed with `Permission denied (publickey)` for anyone without a key. That entry
-is gone — cellstream comes from PyPI.)
+pin with no manual `--extra-index-url`. cellstream resolves from PyPI like any
+other dependency, so no repository access is involved.
 
 ### conda / mamba
 
